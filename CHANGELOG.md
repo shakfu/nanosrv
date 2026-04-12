@@ -29,6 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build system using scikit-build-core with nanobind
 - Makefile with targets for build, test, lint, format, typecheck, QA, wheel, sdist, and publish
 - `Makefile.server` for building standalone C++ servers via CMake
-- Benchmark scripts (`bench.sh`, `bench_pynanosrv_server.py`, `bench_pynanosrv_sharded.py`) for wrk-based performance comparison
+- Benchmark scripts (`bench.sh`, `bench_pynanosrv_server.py`, `bench_pynanosrv_sharded.py`) for wrk-based performance comparison of all server implementations
 - GitHub Actions CI workflows for Python tests and build/publish
 - MIT license

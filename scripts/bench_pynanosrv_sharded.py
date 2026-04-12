@@ -1,4 +1,4 @@
-"""Minimal pynanosrv ShardedManager HTTP server for benchmarking."""
+"""Minimal nanosrv (Python) ShardedManager HTTP server for benchmarking."""
 import sys
 import signal
 import threading
@@ -14,7 +14,7 @@ def main():
         conn.http_reply(200, "Content-Type: text/plain\r\n", "OK\n")
     ))
 
-    print(f"pynanosrv-sharded listening on {url} ({mgr.num_workers} workers)")
+    print(f"nanosrv-sharded listening on {url} ({mgr.num_workers} workers)")
 
     runner = threading.Thread(target=mgr.run, daemon=True)
     runner.start()

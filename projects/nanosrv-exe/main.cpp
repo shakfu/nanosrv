@@ -1,10 +1,11 @@
 #include "nanosrv/nanosrv.hpp"
+#include <CLI11.hpp>
+#include <rang.hpp>
 
 #include <chrono>
 #include <csignal>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <iostream>
 #include <string>
 
 using namespace nanosrv;
@@ -25,37 +26,40 @@ static void busy_spin(int us)
     }
 }
 
-static std::string build_listen_url(int argc, char** argv)
-{
-    int port = 8000;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            port = std::atoi(argv[++i]);
-            if (port < 1 || port > 65535) {
-                fprintf(stderr, "Invalid port\n");
-                exit(1);
-            }
-        } else if (strcmp(argv[i], "--busy") == 0 && i + 1 < argc) {
-            s_busy_us = std::atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s [--port <1-65535>] [--busy <microseconds>]\n", argv[0]);
-            exit(0);
-        }
-    }
-    return "http://0.0.0.0:" + std::to_string(port);
-}
-
 int main(int argc, char** argv)
 {
-    auto url = build_listen_url(argc, argv);
+    CLI::App app{"nanosrv-server -- single-threaded HTTP server"};
+
+    int port = 8000;
+    int busy = 0;
+
+    app.add_option("-p,--port", port, "Listen port")
+        ->default_val(8000)
+        ->check(CLI::Range(1, 65535));
+    app.add_option("-b,--busy", busy, "Microseconds of CPU spin per request")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+
+    std::atexit([]() { std::cout << rang::style::reset; });
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        if (e.get_exit_code() == 0)
+            std::cout << rang::style::bold;
+        else
+            std::cout << rang::style::bold << rang::fg::red;
+        return app.exit(e);
+    }
+
+    s_busy_us = busy;
+    auto url = "http://0.0.0.0:" + std::to_string(port);
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    log_level = MG_LL_ERROR;  // Suppress debug logging for performance
+    log_level = MG_LL_ERROR;
     Manager mgr;
 
-    // Typed HTTP handler: no event code check, no void* cast, just the message.
     auto listener = mgr.http_listen(url,
         [](Connection& c, HttpMessage& hm) {
             busy_spin(s_busy_us);

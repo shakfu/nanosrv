@@ -54,7 +54,7 @@ static void py_ws_upgrade(nanosrv::Connection& c, nanosrv::HttpMessage& hm,
 // ---------------------------------------------------------------------------
 
 NB_MODULE(_core, m) {
-    m.doc() = "pynanosrv -- Python bindings for the nanosrv embedded server library";
+    m.doc() = "nanosrv -- Python bindings for the nanosrv embedded server library";
 
     // -----------------------------------------------------------------------
     // Enums

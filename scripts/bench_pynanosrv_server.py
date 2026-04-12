@@ -1,4 +1,4 @@
-"""Minimal pynanosrv HTTP server for benchmarking."""
+"""Minimal nanosrv (Python) HTTP server for benchmarking."""
 import sys
 import signal
 import nanosrv
@@ -11,7 +11,7 @@ def main():
     mgr = nanosrv.Manager()
     listener = mgr.http_listen(url, lambda conn, msg: (
         conn.http_reply(200, "Content-Type: text/plain\r\n",
-                        f"pynanosrv ready\nMethod: {msg.method}, URI: {msg.uri}\n")
+                        f"nanosrv ready\nMethod: {msg.method}, URI: {msg.uri}\n")
     ))
     if not listener:
         print(f"Failed to listen on {url}", file=sys.stderr)
@@ -24,7 +24,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    print(f"pynanosrv listening on {url}")
+    print(f"nanosrv listening on {url}")
     while running:
         mgr.poll(100)
 

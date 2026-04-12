@@ -19,11 +19,11 @@ WRK="wrk -t${THREADS} -c${CONNECTIONS} -d${DURATION} --latency ${URL}"
 BUILD_DIR=build/cmake
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Binary paths (CMake places executables in their sub-project directories)
-MONGOOSE_SERVER="./${BUILD_DIR}/mongoose-server"
-MUNGO_SERVER="./${BUILD_DIR}/mungo/mungo-server"
-NANOSRV_SERVER="./${BUILD_DIR}/nanosrv-exe/nanosrv-server"
-NANOSRV_SHARDED="./${BUILD_DIR}/nanosrv-sharded/nanosrv-sharded"
+# Binary paths (all executables output to build/)
+MONGOOSE_SERVER="./build/mongoose-server"
+MUNGO_SERVER="./build/mungo-server"
+NANOSRV_SERVER="./build/nanosrv-server"
+NANOSRV_SHARDED="./build/nanosrv-sharded"
 REPORT=build/bench-report.html
 
 BUSY_VALUES=(0 10 50 100 500)
@@ -116,10 +116,10 @@ run_comparison "nanosrv-server (C++, single-thread)" \
 run_comparison "nanosrv-sharded (C++, multi-thread)" \
     ${NANOSRV_SHARDED} --port "$PORT"
 
-run_comparison "pynanosrv Manager (Python, single-thread)" \
+run_comparison "nanosrv Python Manager (single-thread)" \
     uv run python "${SCRIPT_DIR}/bench_pynanosrv_server.py" "$PORT"
 
-run_comparison "pynanosrv ShardedManager (Python, multi-thread)" \
+run_comparison "nanosrv Python ShardedManager (multi-thread)" \
     uv run python "${SCRIPT_DIR}/bench_pynanosrv_sharded.py" "$PORT"
 
 # Terminal summary

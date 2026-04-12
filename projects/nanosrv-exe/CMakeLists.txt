@@ -10,3 +10,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 add_executable(nanosrv-server main.cpp)
 target_link_libraries(nanosrv-server PRIVATE nanosrv)
+target_include_directories(nanosrv-server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/include
+)

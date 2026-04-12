@@ -5,7 +5,7 @@
         server-build server-run server-test server-clean bench
 
 # ---------------------------------------------------------------------------
-# Python extension (pynanosrv)
+# Python bindings (nanosrv)
 # ---------------------------------------------------------------------------
 
 # Default target
@@ -17,12 +17,12 @@ sync:
 
 # Build/rebuild the extension after code changes
 build:
-	@uv sync --reinstall-package pynanosrv
+	@uv sync --reinstall-package nanosrv
 
 # Alias for build
 rebuild: build
 
-# Run pynanosrv tests
+# Run nanosrv tests
 test:
 	@uv run pytest tests/ -v
 
@@ -36,7 +36,7 @@ format:
 
 # Type check with mypy
 typecheck:
-	@uv run mypy src/pynanosrv/__init__.py tests/ --exclude '.venv'
+	@uv run mypy src/nanosrv/__init__.py tests/ --exclude '.venv'
 
 # Run a full quality assurance check
 qa: test lint typecheck format
@@ -71,11 +71,11 @@ upgrade:
 
 # Run tests with coverage
 coverage:
-	@uv run pytest tests/ -v --cov=src/pynanosrv --cov-report=term-missing
+	@uv run pytest tests/ -v --cov=src/nanosrv --cov-report=term-missing
 
 # Generate HTML coverage report
 coverage-html:
-	@uv run pytest tests/ -v --cov=src/pynanosrv --cov-report=html
+	@uv run pytest tests/ -v --cov=src/nanosrv --cov-report=html
 	@echo "Coverage report: htmlcov/index.html"
 
 # Build documentation (requires sphinx in dev dependencies)
@@ -103,7 +103,7 @@ server-build:
 	cmake --build $(SERVER_BUILD_DIR)
 
 server-run: server-build
-	$(SERVER_BUILD_DIR)/nanosrv-exe/nanosrv-server
+	build/nanosrv-server
 
 server-test: server-build
 	ctest --test-dir $(SERVER_BUILD_DIR) --output-on-failure
@@ -146,7 +146,7 @@ help:
 	@echo "  all            - Build/rebuild the extension (default)"
 	@echo "  sync           - Sync environment (initial setup)"
 	@echo "  build          - Rebuild extension after code changes"
-	@echo "  test           - Run pynanosrv pytest suite"
+	@echo "  test           - Run nanosrv pytest suite"
 	@echo "  lint           - Lint with ruff"
 	@echo "  format         - Format with ruff"
 	@echo "  typecheck      - Type check with mypy"

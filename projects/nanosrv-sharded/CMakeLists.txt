@@ -10,3 +10,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 add_executable(nanosrv-sharded main_sharded.cpp)
 target_link_libraries(nanosrv-sharded PRIVATE nanosrv)
+target_include_directories(nanosrv-sharded PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/include
+)

@@ -12,7 +12,7 @@ static void handler(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *)ev_data;
         mg_http_reply(c, 200, "Content-Type: text/plain\r\n",
-                      "nanosrv-c ready\nMethod: %.*s, URI: %.*s\n",
+                      "mungo-server ready\nMethod: %.*s, URI: %.*s\n",
                       (int)hm->method.len, hm->method.buf,
                       (int)hm->uri.len, hm->uri.buf);
     }
@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("nanosrv-c listening on %s\n", url);
+    printf("mungo-server listening on %s\n", url);
     while (!s_signal) {
         mg_mgr_poll(&mgr, 100);
     }
