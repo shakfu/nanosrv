@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- CLI11 argument parsing for `nanosrv-server` and `nanosrv-sharded` with short flags (`-p`, `-b`, `-t`), validation, and `--help`
+- Colored terminal output via rang (bold help text, bold red errors)
+- README for each sub-project (`projects/mungo`, `projects/nanosrv`, `projects/nanosrv-exe`, `projects/nanosrv-sharded`)
+
+### Changed
+
+- Renamed CMake target `mungo-server` (was `nanosrv-c`) to avoid confusion with the nanosrv library family
+- Renamed all `pynanosrv` references to `nanosrv` -- the Python package was already named `nanosrv` in pyproject.toml
+- All build outputs (executables, static libraries) now go to `./build/` instead of scattered CMake sub-directories
+- Benchmark script uses explicit binary path variables and updated labels
+
+### Fixed
+
+- `make bench` failed because the bench script referenced a non-existent `nanosrv-c` binary
+- `make server-run` pointed to wrong binary path
+
 ## [0.1.0] - 2026-04-07
 
 ### Added
