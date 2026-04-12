@@ -1,0 +1,341 @@
+"""Tests for nanosrv nanobind extension module."""
+
+import threading
+import time
+import urllib.request
+import urllib.error
+
+import nanosrv
+
+
+# ---------------------------------------------------------------------------
+# Enum tests
+# ---------------------------------------------------------------------------
+
+class TestEnums:
+    def test_event_values(self):
+        assert nanosrv.Event.Error.value == 0
+        assert nanosrv.Event.Open.value == 1
+        assert nanosrv.Event.HttpMessage.value == 11
+        assert nanosrv.Event.WsOpen.value == 12
+        assert nanosrv.Event.WsMessage.value == 13
+        assert nanosrv.Event.Wakeup.value == 20
+        assert nanosrv.Event.User.value == 100
+
+    def test_ws_opcode_values(self):
+        assert nanosrv.WsOpcode.Text.value == 1
+        assert nanosrv.WsOpcode.Binary.value == 2
+        assert nanosrv.WsOpcode.Close.value == 8
+        assert nanosrv.WsOpcode.Ping.value == 9
+        assert nanosrv.WsOpcode.Pong.value == 10
+
+    def test_log_level_values(self):
+        assert getattr(nanosrv.LogLevel, "None").value == 0
+        assert nanosrv.LogLevel.Error.value == 1
+        assert nanosrv.LogLevel.Info.value == 2
+        assert nanosrv.LogLevel.Debug.value == 3
+        assert nanosrv.LogLevel.Verbose.value == 4
+
+
+# ---------------------------------------------------------------------------
+# URL parsing tests
+# ---------------------------------------------------------------------------
+
+class TestUrl:
+    def test_parse_http(self):
+        u = nanosrv.Url.parse("http://example.com:8080/path")
+        assert u.host == "example.com"
+        assert u.port == 8080
+        assert u.path == "/path"
+        assert u.is_ssl is False
+
+    def test_parse_https(self):
+        u = nanosrv.Url.parse("https://example.com/secure")
+        assert u.host == "example.com"
+        assert u.port == 443
+        assert u.is_ssl is True
+
+    def test_parse_default_port(self):
+        u = nanosrv.Url.parse("http://localhost/")
+        assert u.host == "localhost"
+        assert u.port == 80
+
+    def test_repr(self):
+        u = nanosrv.Url.parse("http://localhost:9999/test")
+        r = repr(u)
+        assert "localhost" in r
+        assert "9999" in r
+
+
+# ---------------------------------------------------------------------------
+# Base64 tests
+# ---------------------------------------------------------------------------
+
+class TestBase64:
+    def test_encode(self):
+        assert nanosrv.base64_encode("hello") == "aGVsbG8="
+
+    def test_decode(self):
+        assert nanosrv.base64_decode("aGVsbG8=") == "hello"
+
+    def test_roundtrip(self):
+        original = "The quick brown fox jumps over the lazy dog"
+        assert nanosrv.base64_decode(nanosrv.base64_encode(original)) == original
+
+    def test_empty(self):
+        assert nanosrv.base64_encode("") == ""
+        assert nanosrv.base64_decode("") == ""
+
+
+# ---------------------------------------------------------------------------
+# URL encode/decode tests
+# ---------------------------------------------------------------------------
+
+class TestUrlEncodeDecode:
+    def test_encode(self):
+        result = nanosrv.url_encode("hello world")
+        assert result == "hello%20world"
+
+    def test_decode(self):
+        result = nanosrv.url_decode("hello%20world")
+        assert result == "hello world"
+
+    def test_roundtrip(self):
+        original = "key=value&foo=bar baz"
+        assert nanosrv.url_decode(nanosrv.url_encode(original)) == original
+
+    def test_special_chars(self):
+        encoded = nanosrv.url_encode("a+b=c&d")
+        assert "%" in encoded
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing tests
+# ---------------------------------------------------------------------------
+
+class TestJson:
+    def test_number(self):
+        result = nanosrv.json.number('{"x": 3.14}', "$.x")
+        assert result is not None
+        assert abs(result - 3.14) < 1e-9
+
+    def test_boolean(self):
+        assert nanosrv.json.boolean('{"flag": true}', "$.flag") is True
+        assert nanosrv.json.boolean('{"flag": false}', "$.flag") is False
+
+    def test_integer(self):
+        result = nanosrv.json.integer('{"n": 42}', "$.n")
+        assert result == 42
+
+    def test_string(self):
+        result = nanosrv.json.string('{"name": "nanosrv"}', "$.name")
+        assert result == "nanosrv"
+
+    def test_missing_path(self):
+        assert nanosrv.json.number('{"x": 1}', "$.y") is None
+        assert nanosrv.json.string('{"x": 1}', "$.y") is None
+
+    def test_nested(self):
+        j = '{"a": {"b": 99}}'
+        assert nanosrv.json.integer(j, "$.a.b") == 99
+
+
+# ---------------------------------------------------------------------------
+# Logging tests
+# ---------------------------------------------------------------------------
+
+class TestLogging:
+    def test_set_get_log_level(self):
+        original = nanosrv.get_log_level()
+        nanosrv.set_log_level(nanosrv.LogLevel.Debug)
+        assert nanosrv.get_log_level() == nanosrv.LogLevel.Debug
+        nanosrv.set_log_level(original)
+
+    def test_all_levels(self):
+        for level in [getattr(nanosrv.LogLevel, "None"), nanosrv.LogLevel.Error,
+                      nanosrv.LogLevel.Info, nanosrv.LogLevel.Debug,
+                      nanosrv.LogLevel.Verbose]:
+            nanosrv.set_log_level(level)
+            assert nanosrv.get_log_level() == level
+        nanosrv.set_log_level(getattr(nanosrv.LogLevel, "None"))
+
+
+# ---------------------------------------------------------------------------
+# Millis test
+# ---------------------------------------------------------------------------
+
+class TestMillis:
+    def test_returns_positive(self):
+        t = nanosrv.millis()
+        assert t > 0
+
+    def test_monotonic(self):
+        t1 = nanosrv.millis()
+        t2 = nanosrv.millis()
+        assert t2 >= t1
+
+
+# ---------------------------------------------------------------------------
+# Manager tests
+# ---------------------------------------------------------------------------
+
+class TestManager:
+    def test_create(self):
+        mgr = nanosrv.Manager()
+        assert mgr is not None
+
+    def test_poll(self):
+        mgr = nanosrv.Manager()
+        mgr.poll(1)  # should not block significantly
+
+
+# ---------------------------------------------------------------------------
+# HTTP server integration test
+# ---------------------------------------------------------------------------
+
+class TestHttpServer:
+    def test_request_response(self):
+        mgr = nanosrv.Manager()
+        received = {}
+
+        def handler(conn, msg):
+            received["method"] = msg.method
+            received["uri"] = msg.uri
+            received["body"] = msg.body
+            conn.http_reply(200, "Content-Type: text/plain\r\n",
+                            f"echo:{msg.uri}")
+
+        ref = mgr.http_listen("http://0.0.0.0:18321", handler)
+        assert ref
+
+        # Run the server in a background thread
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(10)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+
+        try:
+            # Give the server a moment to start
+            time.sleep(0.05)
+            resp = urllib.request.urlopen("http://127.0.0.1:18321/hello")
+            body = resp.read().decode()
+            assert body == "echo:/hello"
+            assert resp.status == 200
+
+            assert received["method"] == "GET"
+            assert received["uri"] == "/hello"
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
+    def test_post_body(self):
+        mgr = nanosrv.Manager()
+
+        def handler(conn, msg):
+            conn.http_reply(200, "", msg.body)
+
+        mgr.http_listen("http://0.0.0.0:18322", handler)
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(10)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+
+        try:
+            time.sleep(0.05)
+            req = urllib.request.Request(
+                "http://127.0.0.1:18322/echo",
+                data=b"test-payload",
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req)
+            assert resp.read() == b"test-payload"
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
+    def test_http_message_properties(self):
+        mgr = nanosrv.Manager()
+        captured = {}
+
+        def handler(conn, msg):
+            captured["repr"] = repr(msg)
+            captured["query"] = msg.query
+            h = msg.header("User-Agent")
+            captured["user_agent"] = h
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://0.0.0.0:18323", handler)
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(10)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+
+        try:
+            time.sleep(0.05)
+            resp = urllib.request.urlopen(
+                "http://127.0.0.1:18323/path?key=val"
+            )
+            resp.read()
+            assert "GET" in captured["repr"]
+            assert "key=val" in captured["query"]
+            assert captured["user_agent"] is not None
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Connection properties test
+# ---------------------------------------------------------------------------
+
+class TestConnectionProperties:
+    def test_connection_flags(self):
+        mgr = nanosrv.Manager()
+        props = {}
+
+        def handler(conn, msg):
+            props["id"] = conn.id
+            props["is_websocket"] = conn.is_websocket
+            props["is_listening"] = conn.is_listening
+            props["is_tls"] = conn.is_tls
+            props["is_accepted"] = conn.is_accepted
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://0.0.0.0:18324", handler)
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(10)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+
+        try:
+            time.sleep(0.05)
+            urllib.request.urlopen("http://127.0.0.1:18324/")
+            time.sleep(0.05)
+
+            assert props["id"] > 0
+            assert props["is_websocket"] is False
+            assert props["is_listening"] is False  # handler conn is accepted, not the listener
+            assert props["is_tls"] is False
+            assert props["is_accepted"] is True
+        finally:
+            stop.set()
+            t.join(timeout=2)
