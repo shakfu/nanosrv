@@ -13,6 +13,9 @@ wheels/
 # Virtual environments
 .venv
 
+# transient-docs
+REVIEW.md
+
 # Agentic
 .claude
 CLAUDE.md
