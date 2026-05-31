@@ -36,6 +36,28 @@ jobs:
       - name: Run unit tests under sanitizers
         run: ctest --test-dir build/asan -R unit_tests --output-on-failure
 
+  tsan:
+    name: Unit tests (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build
+
+      - name: Configure (NANOSRV_TSAN=ON)
+        run: cmake -B build/tsan -S projects -G Ninja -DNANOSRV_TSAN=ON
+
+      - name: Build
+        run: cmake --build build/tsan
+
+      - name: Run unit tests under ThreadSanitizer
+        run: ctest --test-dir build/tsan -R unit_tests --output-on-failure
+
   fuzz:
     name: Fuzz smoke (libFuzzer)
     runs-on: ubuntu-latest

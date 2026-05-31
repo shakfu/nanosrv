@@ -62,9 +62,11 @@ void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
             Mgr* mgr;
         };
 
-        auto* ctx = new AdoptCtx{h, q, mgr_raw};
+        auto ctx = std::make_shared<AdoptCtx>(AdoptCtx{h, q, mgr_raw});
+        listen_state_.push_back(ctx);  // own it; freed in ~ShardedManager
 
-        // Use a timer (1ms repeat) to drain the queue.
+        // Use a timer (1ms repeat) to drain the queue. The timer holds a raw
+        // (non-owning) pointer; the manager owns the AdoptCtx via listen_state_.
         timer_add(mgr_raw, 1, MG_TIMER_REPEAT,
             [](void* arg) {
                 auto* ctx = static_cast<AdoptCtx*>(arg);
@@ -103,7 +105,7 @@ void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
                     }
                 }
             },
-            ctx);
+            ctx.get());
     }
 
     // The acceptor listens on the URL. On MG_EV_ACCEPT, steal the FD
@@ -113,10 +115,14 @@ void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
         std::atomic<unsigned>* next;
         unsigned num_workers;
     };
-    auto* actx = new AcceptCtx{queues, &next_, static_cast<unsigned>(workers_.size())};
+    auto actx = std::make_shared<AcceptCtx>(
+        AcceptCtx{queues, &next_, static_cast<unsigned>(workers_.size())});
+    auto* actx_raw = actx.get();
+    listen_state_.push_back(actx);  // own it; freed in ~ShardedManager
 
     acceptor_.http_listen(url_str,
-        HandlerFn([actx](Connection& c, Event ev, void*) {
+        HandlerFn([actx_raw](Connection& c, Event ev, void*) {
+            auto* actx = actx_raw;  // non-owning; manager owns via listen_state_
             if (ev == Event::Accept) {
                 // Steal the FD from the accepted connection
                 Address rem = c.rem;

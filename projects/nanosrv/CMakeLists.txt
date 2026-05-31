@@ -39,7 +39,13 @@ target_compile_options(nanosrv PRIVATE -Wall -Wextra -O2)
 # unaffected)
 # ---------------------------------------------------------------------------
 option(NANOSRV_SANITIZE "Build the library and tests with ASan+UBSan" OFF)
+option(NANOSRV_TSAN "Build the library and tests with ThreadSanitizer" OFF)
 option(NANOSRV_FUZZ "Build libFuzzer targets (implies sanitizers; clang only)" OFF)
+
+# TSan is mutually exclusive with ASan.
+if(NANOSRV_TSAN AND NANOSRV_SANITIZE)
+    message(FATAL_ERROR "NANOSRV_TSAN and NANOSRV_SANITIZE are mutually exclusive")
+endif()
 
 # Fuzzing requires the internal-parser wrapper and an instrumented library.
 if(NANOSRV_FUZZ)
@@ -57,6 +63,12 @@ if(NANOSRV_SANITIZE)
         -fsanitize=address,undefined -fno-sanitize-recover=all
         -fno-omit-frame-pointer -g -O1)
     target_link_options(nanosrv PUBLIC -fsanitize=address,undefined)
+endif()
+
+if(NANOSRV_TSAN)
+    target_compile_options(nanosrv PUBLIC
+        -fsanitize=thread -fno-omit-frame-pointer -g -O1)
+    target_link_options(nanosrv PUBLIC -fsanitize=thread)
 endif()
 
 # ---------------------------------------------------------------------------

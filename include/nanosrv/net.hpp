@@ -311,6 +311,13 @@ private:
     std::atomic<unsigned> next_{0};
     std::shared_ptr<std::vector<WorkerQueue>> queues_;
     std::shared_ptr<HttpHandler> handler_;
+    // Owns the per-listen heap contexts (AdoptCtx per worker, AcceptCtx) so they
+    // are freed when the manager is destroyed instead of leaking. Type-erased
+    // because the context types are private to sharded.cpp. Destroyed after the
+    // worker/acceptor loops have stopped (run() joins before returning), so the
+    // raw pointers captured by the timer/accept callbacks stay valid for their
+    // whole active lifetime.
+    std::vector<std::shared_ptr<void>> listen_state_;
 };
 
 } // namespace nanosrv

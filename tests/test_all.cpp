@@ -9,6 +9,16 @@
 #include <string_view>
 #include <thread>
 
+#ifndef _WIN32
+#include <atomic>
+#include <vector>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
 using namespace nanosrv;
 using namespace std::chrono_literals;
 
@@ -349,6 +359,86 @@ static void test_connection_send_bytes()
     assert(sent_ok);
 }
 
+#ifndef _WIN32
+// Minimal blocking HTTP client: connect, send a GET, return true iff the
+// response status line carries "200". Uses a recv timeout so a hung worker
+// fails the test instead of hanging it.
+static bool http_get_200(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return false;
+
+    struct timeval tv{};
+    tv.tv_sec = 3;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    bool ok = false;
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0) {
+        const char* req =
+            "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        if (send(fd, req, strlen(req), 0) == static_cast<ssize_t>(strlen(req))) {
+            char buf[512];
+            ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                ok = strstr(buf, " 200 ") != nullptr;
+            }
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+// H3: exercise the sharded accept-and-hand-off path under real concurrency.
+// One acceptor distributes FDs to N workers; many simultaneous clients must
+// each be served. Run under ASan/TSan this covers the cross-thread FD handoff
+// (detach_fd -> per-worker queue -> wrapfd adopt -> http_cb -> reply -> close)
+// and the per-listen context ownership (no leaks).
+static void test_sharded_concurrent_requests()
+{
+    const uint16_t port = 18890;
+    const int num_workers = 4;
+    const int num_clients = 32;
+
+    ShardedManager sharded(num_workers);
+    assert(sharded.num_workers() == num_workers);
+
+    std::atomic<int> served{0};
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [&served](Connection& c, HttpMessage&) {
+            served.fetch_add(1, std::memory_order_relaxed);
+            http_reply(&c, 200, "Content-Type: text/plain\r\n", "ok");
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(100ms);  // let workers + acceptor start polling
+
+    std::atomic<int> ok_count{0};
+    std::vector<std::thread> clients;
+    clients.reserve(num_clients);
+    for (int i = 0; i < num_clients; i++)
+        clients.emplace_back([&ok_count, port]() {
+            if (http_get_200(port))
+                ok_count.fetch_add(1, std::memory_order_relaxed);
+        });
+    for (auto& t : clients)
+        t.join();
+
+    sharded.stop();
+    runner.join();  // must return before sharded is destroyed (teardown contract)
+
+    assert(ok_count.load() == num_clients);
+    assert(served.load() == num_clients);
+}
+#endif  // _WIN32
+
 int main()
 {
     test_base64_roundtrip();
@@ -382,6 +472,10 @@ int main()
         assert(sharded.num_workers() == 2);
         // Construction/destruction without run() should not crash
     }
+
+#ifndef _WIN32
+    test_sharded_concurrent_requests();
+#endif
 
     puts("All tests passed");
     return 0;

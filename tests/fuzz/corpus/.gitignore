@@ -1,0 +1,7 @@
+# libFuzzer writes coverage-increasing inputs back into these directories at
+# runtime. Those are generated artifacts -- track only the hand-authored
+# *.seed files (and this .gitignore), not the grown corpus.
+*
+!.gitignore
+!*/
+!*.seed
