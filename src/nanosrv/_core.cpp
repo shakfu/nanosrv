@@ -8,7 +8,9 @@
 #include <nanosrv/nanosrv.hpp>
 
 #include <functional>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -16,37 +18,134 @@ namespace nb = nanobind;
 using namespace nb::literals;
 
 // ---------------------------------------------------------------------------
-// Thin wrappers where the C++ API uses varargs or needs GIL management
+// Callback lifetime (fixes H1)
+// ---------------------------------------------------------------------------
+//
+// A Python callable handed to http_listen must stay alive as long as the
+// listener. It is captured (by value) into the C++ handler lambda, which the
+// event loop owns via the listener connection's fn_data, so the natural
+// lifetime is "until the listener closes". We hold the callable in a
+// shared_ptr<nb::object> whose ownership is exactly the handler's; no extra
+// reference is leaked.
+//
+// The one subtlety is the GIL: poll()/run() release the GIL, and the listener
+// (hence the handler, hence this shared_ptr) may be destroyed while the GIL is
+// not held -- e.g. when the Manager is torn down, or if the listener closes
+// mid-poll. Destroying an nb::object calls Py_DECREF, which requires the GIL.
+// The custom deleter below acquires the GIL before destroying the object, so
+// teardown is safe regardless of who drops the last reference. (gil_scoped_acquire
+// is reentrant, so this is also fine when the GIL is already held.)
+static std::shared_ptr<nb::object> make_callback(nb::object callback)
+{
+    return std::shared_ptr<nb::object>(new nb::object(std::move(callback)),
+                                       [](nb::object* o) {
+                                           nb::gil_scoped_acquire acquire;
+                                           delete o;
+                                       });
+}
+
+// ---------------------------------------------------------------------------
+// Scoped-validity wrappers (fixes H2)
+// ---------------------------------------------------------------------------
+//
+// Connection, HttpMessage and WsMessage handed to a handler are only valid for
+// the duration of that handler call: HttpMessage/WsMessage are transient (the
+// struct lives on the C++ stack and its fields point into the connection's recv
+// buffer), and the Connection may be freed by the event loop once it closes.
+// Previously these were passed to Python as raw non-owning pointers, so a
+// handler that stored `conn` or `msg` and touched it later was a use-after-free.
+//
+// Each wrapper now shares a small "alive" token with the trampoline that created
+// it. The trampoline sets the token false as soon as the handler returns, so any
+// stored wrapper raises RuntimeError on use instead of dereferencing freed or
+// transient memory. To act on a connection after the handler returns, store
+// `conn.id` and use Manager.wakeup(id) -- the intended mechanism for that.
+
+using Alive = std::shared_ptr<bool>;
+
+[[noreturn]] static void raise_expired(const char* what)
+{
+    throw std::runtime_error(
+        std::string(what) +
+        " used outside its handler scope (it is only valid during the "
+        "callback). Keep conn.id and use Manager.wakeup(id) instead.");
+}
+
+struct PyConn {
+    nanosrv::Connection* c = nullptr;
+    Alive alive;
+    nanosrv::Connection* get() const
+    {
+        if (!alive || !*alive)
+            raise_expired("Connection");
+        return c;
+    }
+};
+
+struct PyHttpMsg {
+    nanosrv::HttpMessage* hm = nullptr;
+    Alive alive;
+    nanosrv::HttpMessage* get() const
+    {
+        if (!alive || !*alive)
+            raise_expired("HttpMessage");
+        return hm;
+    }
+};
+
+struct PyWsMsg {
+    nanosrv::WsMessage* wm = nullptr;
+    Alive alive;
+    nanosrv::WsMessage* get() const
+    {
+        if (!alive || !*alive)
+            raise_expired("WsMessage");
+        return wm;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Thin wrappers where the C++ API uses varargs or needs argument adaptation
 // ---------------------------------------------------------------------------
 
-static void py_http_reply(nanosrv::Connection& c, int status,
-                          const std::string& headers,
-                          const std::string& body) {
-    nanosrv::http_reply(&c, status, headers.c_str(), "%.*s",
-                      static_cast<int>(body.size()), body.data());
+static void py_http_reply(PyConn& c, int status, const std::string& headers,
+                          const std::string& body)
+{
+    nanosrv::http_reply(c.get(), status, headers.c_str(), "%.*s",
+                        static_cast<int>(body.size()), body.data());
 }
 
 static void py_http_reply_ref(nanosrv::ConnectionRef& ref, int status,
                               const std::string& headers,
-                              const std::string& body) {
-    py_http_reply(*ref, status, headers, body);
+                              const std::string& body)
+{
+    nanosrv::http_reply(&*ref, status, headers.c_str(), "%.*s",
+                        static_cast<int>(body.size()), body.data());
 }
 
-static size_t py_ws_send_text(nanosrv::Connection& c, const std::string& data) {
-    return nanosrv::ws_send(&c, data.data(), data.size(), WEBSOCKET_OP_TEXT);
+static size_t py_ws_send_text(PyConn& c, const std::string& data)
+{
+    return nanosrv::ws_send(c.get(), data.data(), data.size(), WEBSOCKET_OP_TEXT);
 }
 
-static size_t py_ws_send_binary(nanosrv::Connection& c, nb::bytes data) {
-    return nanosrv::ws_send(&c, data.c_str(), data.size(), WEBSOCKET_OP_BINARY);
+static size_t py_ws_send_binary(PyConn& c, nb::bytes data)
+{
+    return nanosrv::ws_send(c.get(), data.c_str(), data.size(), WEBSOCKET_OP_BINARY);
 }
 
-static size_t py_ws_send_op(nanosrv::Connection& c, nb::bytes data, int op) {
-    return nanosrv::ws_send(&c, data.c_str(), data.size(), op);
+static size_t py_ws_send_op(PyConn& c, nb::bytes data, int op)
+{
+    return nanosrv::ws_send(c.get(), data.c_str(), data.size(), op);
 }
 
-static void py_ws_upgrade(nanosrv::Connection& c, nanosrv::HttpMessage& hm,
-                          const std::string& headers) {
-    nanosrv::ws_upgrade(&c, &hm, "%s", headers.c_str());
+static void py_ws_upgrade(PyConn& c, PyHttpMsg& hm, const std::string& headers)
+{
+    nanosrv::ws_upgrade(c.get(), hm.get(), "%s", headers.c_str());
+}
+
+static bool py_conn_send_bytes(PyConn& c, std::string_view data)
+{
+    return c.get()->send_bytes(data);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,66 +209,85 @@ NB_MODULE(_core, m) {
         });
 
     // -----------------------------------------------------------------------
-    // HttpMessage (read-only view of an incoming HTTP request/response)
+    // HttpMessage (read-only view of an incoming HTTP request/response).
+    // Valid only during the handler call that receives it.
     // -----------------------------------------------------------------------
-    nb::class_<nanosrv::HttpMessage>(m, "HttpMessage")
-        .def_prop_ro("method", &nanosrv::HttpMessage::method_str)
-        .def_prop_ro("uri", &nanosrv::HttpMessage::uri_str)
-        .def_prop_ro("query", &nanosrv::HttpMessage::query_str)
-        .def_prop_ro("body", &nanosrv::HttpMessage::body_str)
-        .def_prop_ro("status_code", &nanosrv::HttpMessage::status_code)
-        .def("header", &nanosrv::HttpMessage::header, "name"_a,
-             "Return the value of an HTTP header, or None if not present.")
-        .def("credentials", &nanosrv::HttpMessage::credentials,
-             "Return (user, password) from Authorization header.")
-        .def("__repr__", [](const nanosrv::HttpMessage& hm) {
+    nb::class_<PyHttpMsg>(m, "HttpMessage")
+        .def_prop_ro("method", [](const PyHttpMsg& m) {
+            return m.get()->method_str();
+        })
+        .def_prop_ro("uri", [](const PyHttpMsg& m) {
+            return m.get()->uri_str();
+        })
+        .def_prop_ro("query", [](const PyHttpMsg& m) {
+            return m.get()->query_str();
+        })
+        .def_prop_ro("body", [](const PyHttpMsg& m) {
+            return m.get()->body_str();
+        })
+        .def_prop_ro("status_code", [](const PyHttpMsg& m) {
+            return m.get()->status_code();
+        })
+        .def("header", [](const PyHttpMsg& m, const char* name) {
+            return m.get()->header(name);
+        }, "name"_a,
+           "Return the value of an HTTP header, or None if not present.")
+        .def("credentials", [](const PyHttpMsg& m) {
+            return m.get()->credentials();
+        }, "Return (user, password) from Authorization header.")
+        .def("__repr__", [](const PyHttpMsg& m) {
+            auto* hm = m.get();
             return std::string("HttpMessage(method='") +
-                   std::string(hm.method_str()) + "', uri='" +
-                   std::string(hm.uri_str()) + "')";
+                   std::string(hm->method_str()) + "', uri='" +
+                   std::string(hm->uri_str()) + "')";
         });
 
     // -----------------------------------------------------------------------
-    // WsMessage (read-only view of a WebSocket frame)
+    // WsMessage (read-only view of a WebSocket frame).
+    // Valid only during the handler call that receives it.
     // -----------------------------------------------------------------------
-    nb::class_<nanosrv::WsMessage>(m, "WsMessage")
-        .def_prop_ro("data", [](const nanosrv::WsMessage& wm) {
-            return std::string_view(wm.data.buf, wm.data.len);
+    nb::class_<PyWsMsg>(m, "WsMessage")
+        .def_prop_ro("data", [](const PyWsMsg& m) {
+            auto* wm = m.get();
+            return std::string_view(wm->data.buf, wm->data.len);
         })
-        .def_prop_ro("flags", [](const nanosrv::WsMessage& wm) -> int {
-            return wm.flags;
+        .def_prop_ro("flags", [](const PyWsMsg& m) -> int {
+            return m.get()->flags;
         })
-        .def_prop_ro("opcode", [](const nanosrv::WsMessage& wm) -> WsOpcode {
-            return static_cast<WsOpcode>(wm.flags & 0x0f);
+        .def_prop_ro("opcode", [](const PyWsMsg& m) -> WsOpcode {
+            return static_cast<WsOpcode>(m.get()->flags & 0x0f);
         });
 
     // -----------------------------------------------------------------------
-    // Connection (passed to event handlers, used to send responses)
+    // Connection (passed to event handlers, used to send responses).
+    // Valid only during the handler call that receives it; to act on a
+    // connection later, keep conn.id and use Manager.wakeup(id).
     // -----------------------------------------------------------------------
-    nb::class_<nanosrv::Connection>(m, "Connection")
-        .def_prop_ro("id", [](const nanosrv::Connection& c) {
-            return c.id;
+    nb::class_<PyConn>(m, "Connection")
+        .def_prop_ro("id", [](const PyConn& c) {
+            return c.get()->id;
         })
-        .def_prop_ro("is_websocket", [](const nanosrv::Connection& c) {
-            return static_cast<bool>(c.is_websocket);
+        .def_prop_ro("is_websocket", [](const PyConn& c) {
+            return static_cast<bool>(c.get()->is_websocket);
         })
-        .def_prop_ro("is_listening", [](const nanosrv::Connection& c) {
-            return static_cast<bool>(c.is_listening);
+        .def_prop_ro("is_listening", [](const PyConn& c) {
+            return static_cast<bool>(c.get()->is_listening);
         })
-        .def_prop_ro("is_client", [](const nanosrv::Connection& c) {
-            return static_cast<bool>(c.is_client);
+        .def_prop_ro("is_client", [](const PyConn& c) {
+            return static_cast<bool>(c.get()->is_client);
         })
-        .def_prop_ro("is_accepted", [](const nanosrv::Connection& c) {
-            return static_cast<bool>(c.is_accepted);
+        .def_prop_ro("is_accepted", [](const PyConn& c) {
+            return static_cast<bool>(c.get()->is_accepted);
         })
-        .def_prop_ro("is_tls", [](const nanosrv::Connection& c) {
-            return static_cast<bool>(c.is_tls);
+        .def_prop_ro("is_tls", [](const PyConn& c) {
+            return static_cast<bool>(c.get()->is_tls);
         })
-        .def_prop_ro("is_closing", [](const nanosrv::Connection& c) {
-            return static_cast<bool>(c.is_closing);
+        .def_prop_ro("is_closing", [](const PyConn& c) {
+            return static_cast<bool>(c.get()->is_closing);
         })
-        .def("send_bytes", &nanosrv::Connection::send_bytes, "data"_a,
+        .def("send_bytes", &py_conn_send_bytes, "data"_a,
              "Send raw bytes on the connection.")
-        .def("close", &nanosrv::Connection::set_closing,
+        .def("close", [](PyConn& c) { c.get()->set_closing(); },
              "Mark the connection for closing.")
         .def("http_reply", &py_http_reply,
              "status"_a, "headers"_a = "", "body"_a = "",
@@ -212,22 +330,22 @@ NB_MODULE(_core, m) {
         .def("http_listen",
              [](nanosrv::Manager& mgr, std::string_view url,
                 nb::object callback) -> nanosrv::ConnectionRef {
-                 // Prevent the Python callback from being garbage-collected
-                 // while the listener is alive. We leak one ref; the C++
-                 // side will call the captured shared_ptr destructor when
-                 // the listener connection closes.
-                 auto shared_cb = std::make_shared<nb::object>(std::move(callback));
-                 shared_cb->inc_ref();  // prevent GC
+                 auto cb = make_callback(std::move(callback));
 
                  HttpHandler handler =
-                     [shared_cb](nanosrv::Connection& c,
-                                 nanosrv::HttpMessage& hm) {
+                     [cb](nanosrv::Connection& c, nanosrv::HttpMessage& hm) {
                          nb::gil_scoped_acquire acquire;
+                         auto alive = std::make_shared<bool>(true);
                          try {
-                             (*shared_cb)(&c, &hm);
+                             // Pass by value (temporaries): nanobind moves each
+                             // wrapper into a Python-owned object that outlives
+                             // this call, so a stored wrapper stays valid memory
+                             // and is gated only by the shared `alive` token.
+                             (*cb)(PyConn{&c, alive}, PyHttpMsg{&hm, alive});
                          } catch (nb::python_error& e) {
                              e.restore();
                          }
+                         *alive = false;  // invalidate any stored wrappers
                      };
                  return mgr.http_listen(url, std::move(handler));
              },
@@ -237,29 +355,32 @@ NB_MODULE(_core, m) {
         .def("http_listen_event",
              [](nanosrv::Manager& mgr, std::string_view url,
                 nb::object callback) -> nanosrv::ConnectionRef {
-                 auto shared_cb = std::make_shared<nb::object>(std::move(callback));
-                 shared_cb->inc_ref();
+                 auto cb = make_callback(std::move(callback));
 
                  HandlerFn handler =
-                     [shared_cb](nanosrv::Connection& c, nanosrv::Event ev,
-                                 void* ev_data) {
+                     [cb](nanosrv::Connection& c, nanosrv::Event ev,
+                          void* ev_data) {
                          nb::gil_scoped_acquire acquire;
+                         auto alive = std::make_shared<bool>(true);
                          try {
-                             if (ev == nanosrv::Event::HttpMessage) {
-                                 auto* hm = static_cast<nanosrv::HttpMessage*>(ev_data);
-                                 (*shared_cb)(&c, ev, hm);
-                             } else if (ev == nanosrv::Event::WsOpen) {
-                                 auto* hm = static_cast<nanosrv::HttpMessage*>(ev_data);
-                                 (*shared_cb)(&c, ev, hm);
+                             if (ev == nanosrv::Event::HttpMessage ||
+                                 ev == nanosrv::Event::WsOpen) {
+                                 (*cb)(PyConn{&c, alive}, ev,
+                                       PyHttpMsg{
+                                           static_cast<nanosrv::HttpMessage*>(ev_data),
+                                           alive});
                              } else if (ev == nanosrv::Event::WsMessage) {
-                                 auto* wm = static_cast<nanosrv::WsMessage*>(ev_data);
-                                 (*shared_cb)(&c, ev, wm);
+                                 (*cb)(PyConn{&c, alive}, ev,
+                                       PyWsMsg{
+                                           static_cast<nanosrv::WsMessage*>(ev_data),
+                                           alive});
                              } else {
-                                 (*shared_cb)(&c, ev, nb::none());
+                                 (*cb)(PyConn{&c, alive}, ev, nb::none());
                              }
                          } catch (nb::python_error& e) {
                              e.restore();
                          }
+                         *alive = false;  // invalidate any stored wrappers
                      };
                  return mgr.http_listen(url, std::move(handler));
              },
@@ -279,18 +400,18 @@ NB_MODULE(_core, m) {
         .def("http_listen",
              [](nanosrv::ShardedManager& mgr, std::string_view url,
                 nb::object callback) {
-                 auto shared_cb = std::make_shared<nb::object>(std::move(callback));
-                 shared_cb->inc_ref();  // prevent GC while workers hold refs
+                 auto cb = make_callback(std::move(callback));
 
                  HttpHandler handler =
-                     [shared_cb](nanosrv::Connection& c,
-                                 nanosrv::HttpMessage& hm) {
+                     [cb](nanosrv::Connection& c, nanosrv::HttpMessage& hm) {
                          nb::gil_scoped_acquire acquire;
+                         auto alive = std::make_shared<bool>(true);
                          try {
-                             (*shared_cb)(&c, &hm);
+                             (*cb)(PyConn{&c, alive}, PyHttpMsg{&hm, alive});
                          } catch (nb::python_error& e) {
                              e.restore();
                          }
+                         *alive = false;
                      };
                  mgr.http_listen(url, std::move(handler));
              },

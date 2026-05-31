@@ -5,6 +5,8 @@ import time
 import urllib.request
 import urllib.error
 
+import pytest
+
 import nanosrv
 
 
@@ -339,3 +341,102 @@ class TestConnectionProperties:
         finally:
             stop.set()
             t.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Callback object lifetime (H2): conn/msg handed to a handler are valid only
+# during that call. Storing one and using it afterwards must raise, not crash
+# (use-after-free). To act on a connection later, keep conn.id + Manager.wakeup.
+# ---------------------------------------------------------------------------
+
+class TestCallbackObjectLifetime:
+    def _run_request(self, port, handler):
+        mgr = nanosrv.Manager()
+        mgr.http_listen(f"http://0.0.0.0:{port}", handler)
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(10)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.05)
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/x").read()
+            time.sleep(0.05)
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
+    def test_stored_message_raises_after_callback(self):
+        escaped = {}
+
+        def handler(conn, msg):
+            escaped["msg"] = msg          # smuggle the transient view out
+            conn.http_reply(200, "", "ok")
+
+        self._run_request(18331, handler)
+
+        assert "msg" in escaped
+        # Using the stored HttpMessage after the callback must raise, not crash.
+        with pytest.raises(RuntimeError):
+            _ = escaped["msg"].uri
+        with pytest.raises(RuntimeError):
+            _ = escaped["msg"].header("Host")
+
+    def test_stored_connection_raises_after_callback(self):
+        escaped = {}
+
+        def handler(conn, msg):
+            escaped["conn"] = conn        # smuggle the connection out
+            escaped["id"] = conn.id       # reading inside the callback is fine
+            conn.http_reply(200, "", "ok")
+
+        self._run_request(18332, handler)
+
+        assert escaped["id"] > 0
+        # Acting on the stored Connection after the callback must raise.
+        with pytest.raises(RuntimeError):
+            escaped["conn"].http_reply(200, "", "late")
+        with pytest.raises(RuntimeError):
+            _ = escaped["conn"].id
+
+    def test_many_listeners_do_not_accumulate_errors(self):
+        # Exercises the callback-lifetime path repeatedly. With the previous
+        # per-listener ref leak this still "worked", but the test documents that
+        # repeated listen/handler creation is well-behaved.
+        for i in range(50):
+            mgr = nanosrv.Manager()
+            mgr.http_listen(
+                f"http://0.0.0.0:{18400 + i}",
+                lambda conn, msg: conn.http_reply(200, "", "ok"),
+            )
+            mgr.poll(0)
+            del mgr
+
+    def test_callback_is_released_when_listener_closes(self):
+        # H1 regression: the listener must hold the callback while open and
+        # release it when the Manager is destroyed. The previous binding leaked
+        # one reference per listen (inc_ref with no matching dec_ref), so the
+        # callback was never collected. weakref makes that directly observable.
+        import weakref
+        import gc
+
+        class CB:
+            def __call__(self, conn, msg):
+                conn.http_reply(200, "", "ok")
+
+        cb = CB()
+        ref = weakref.ref(cb)
+        mgr = nanosrv.Manager()
+        mgr.http_listen("http://0.0.0.0:18350", cb)
+        mgr.poll(0)
+
+        del cb           # drop our strong ref; the listener still holds one
+        gc.collect()
+        assert ref() is not None, "callback dropped while listener is open"
+
+        del mgr          # closing the listener must release the callback
+        gc.collect()
+        assert ref() is None, "callback leaked after Manager teardown"
