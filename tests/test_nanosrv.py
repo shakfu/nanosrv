@@ -447,6 +447,41 @@ class TestCallbackObjectLifetime:
             stop.set()
             t.join(timeout=2)
 
+    def test_request_timeout_closes_dribbling_connection(self):
+        # A connection that trickles bytes but never completes a request must be
+        # reaped by the request deadline, even though the trickle keeps the idle
+        # timer fresh. idle_timeout is set high so only request_timeout can close.
+        import socket
+
+        mgr = nanosrv.Manager()
+        mgr.set_request_timeout(200)
+        mgr.set_idle_timeout(5000)
+        assert mgr.request_timeout == 200
+        mgr.http_listen("http://127.0.0.1:18361",
+                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(20)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.05)
+            s = socket.create_connection(("127.0.0.1", 18361), timeout=2)
+            s.settimeout(3.0)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")  # incomplete request
+            # The server should close us via the request deadline (~200ms),
+            # well before the 5s idle timeout. recv returns b"" on close.
+            data = s.recv(16)
+            s.close()
+            assert data == b"", f"expected request-deadline close, got {data!r}"
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
     def test_callback_is_released_when_listener_closes(self):
         # H1 regression: the listener must hold the callback while open and
         # release it when the Manager is destroyed. The previous binding leaked

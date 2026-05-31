@@ -482,6 +482,57 @@ static void test_idle_timeout()
     assert(closed.load() >= 1);     // and a Close event fired for it
 }
 
+// Request-receive deadline: a connection that dribbles bytes but never completes
+// a request must be reaped, even though the dribble keeps the idle timer fresh.
+static void test_request_timeout()
+{
+    std::atomic<int> closed{0};
+    Manager mgr;
+    mgr.set_request_timeout(200);  // ms to complete a request
+    mgr.set_idle_timeout(5000);    // generous: must NOT be what closes us
+    assert(mgr.request_timeout() == 200);
+
+    auto ref = mgr.http_listen("http://127.0.0.1:18893",
+        HandlerFn([&closed](Connection&, Event ev, void*) {
+            if (ev == Event::Close)
+                closed.fetch_add(1, std::memory_order_relaxed);
+        }));
+    assert(ref);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(18893);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+
+    // Send an incomplete request, then trickle bytes that never finish it. The
+    // trickle keeps the idle clock fresh, so only the request deadline can reap
+    // this connection -- and it must, well before the 5s idle timeout.
+    const char* partial = "GET / HTTP/1.1\r\nHost: x\r\n";
+    assert(send(fd, partial, strlen(partial), 0) > 0);
+
+    bool server_closed = false;
+    for (int i = 0; i < 80 && !server_closed; i++) {
+        mgr.poll(20ms);
+        if (i % 3 == 0) {
+            char b = 'X';
+            (void)send(fd, &b, 1, 0);  // keep the connection active
+        }
+        char buf[16];
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 0)
+            server_closed = true;
+        else
+            std::this_thread::sleep_for(10ms);
+    }
+    close(fd);
+
+    assert(server_closed);       // the never-completing request was reaped
+    assert(closed.load() >= 1);
+}
+
 // H3 Stage B: the destructor must shut down an in-flight run() (possibly on
 // another thread) on its own -- without an explicit stop()/join beforehand --
 // rather than racing teardown against the running loops.
@@ -541,6 +592,7 @@ int main()
 
 #ifndef _WIN32
     test_idle_timeout();
+    test_request_timeout();
     test_sharded_concurrent_requests();
     test_sharded_destructor_stops_run();
 #endif

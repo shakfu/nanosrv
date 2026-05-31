@@ -104,6 +104,11 @@ struct Mgr {
     // An accepted connection with no read/write activity for this long is
     // closed by the event loop (defends against connect-and-idle exhaustion).
     int idle_timeout_ms;
+    // Request-receive deadline (ms) for accepted connections. 0 = disabled.
+    // An accepted connection that has buffered a partial request but not
+    // completed it within this window is closed (defends against slow-dribble
+    // slowloris, which keeps the idle timer alive by trickling bytes).
+    int request_timeout_ms;
     bool use_dns6;
     unsigned long nextid;
     void* userdata;
@@ -127,7 +132,8 @@ struct Connection {
     struct Address rem;
     void* fd;
     unsigned long id;
-    uint64_t last_active;  // millis() of last I/O; used for idle timeout
+    uint64_t last_active;   // millis() of last I/O; used for idle timeout
+    uint64_t recv_deadline; // deadline to complete a buffered request; 0 = none
     struct IOBuffer recv;
     struct IOBuffer send;
     struct IOBuffer prof;
@@ -284,6 +290,14 @@ public:
     void set_idle_timeout(int ms) { mgr_.idle_timeout_ms = ms; }
     int idle_timeout() const { return mgr_.idle_timeout_ms; }
 
+    // Request-receive deadline (ms) for accepted connections; 0 disables it
+    // (the default). An accepted connection that buffers a partial request but
+    // does not complete it within this window is closed -- this catches the
+    // slow-dribble slowloris that an idle timeout alone misses. Set generously
+    // if large request bodies are expected, as it bounds total receive time.
+    void set_request_timeout(int ms) { mgr_.request_timeout_ms = ms; }
+    int request_timeout() const { return mgr_.request_timeout_ms; }
+
 private:
     struct Mgr mgr_;
 };
@@ -318,6 +332,12 @@ public:
     void set_idle_timeout(int ms) {
         for (auto& w : workers_)
             w->set_idle_timeout(ms);
+    }
+
+    // Request-receive deadline (ms), applied to every worker. Set before run().
+    void set_request_timeout(int ms) {
+        for (auto& w : workers_)
+            w->set_request_timeout(ms);
     }
 
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }

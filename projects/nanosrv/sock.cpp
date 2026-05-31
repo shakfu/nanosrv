@@ -1017,6 +1017,21 @@ void mgr_poll(struct Mgr* mgr, int ms)
         if (mgr->idle_timeout_ms > 0 && c->is_accepted && !c->is_closing
             && now - c->last_active > (uint64_t)mgr->idle_timeout_ms)
             c->is_closing = 1;
+        // Request-receive deadline: reap accepted connections that buffer a
+        // partial request without completing it in time. recv.len > 0 means an
+        // unconsumed (incomplete) request is pending; it drops to 0 once a
+        // protocol handler consumes a complete message, clearing the deadline.
+        // Excludes WebSockets, whose buffered data is not a pending request.
+        if (mgr->request_timeout_ms > 0 && c->is_accepted && !c->is_closing
+            && !c->is_websocket) {
+            if (c->recv.len == 0) {
+                c->recv_deadline = 0;
+            } else if (c->recv_deadline == 0) {
+                c->recv_deadline = now + (uint64_t)mgr->request_timeout_ms;
+            } else if (now > c->recv_deadline) {
+                c->is_closing = 1;
+            }
+        }
         if (c->is_closing)
             sock_close(c);
     }

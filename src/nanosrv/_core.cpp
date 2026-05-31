@@ -394,7 +394,13 @@ NB_MODULE(_core, m) {
              "Close accepted connections idle (no I/O) for `ms` milliseconds. "
              "0 disables (the default). Also reaps idle WebSockets, so use "
              "application keepalive for those.")
-        .def_prop_ro("idle_timeout", &nanosrv::Manager::idle_timeout);
+        .def_prop_ro("idle_timeout", &nanosrv::Manager::idle_timeout)
+        .def("set_request_timeout", &nanosrv::Manager::set_request_timeout,
+             "ms"_a,
+             "Close accepted connections that buffer a partial request without "
+             "completing it within `ms` milliseconds (slow-dribble defense). "
+             "0 disables (the default). Set generously for large uploads.")
+        .def_prop_ro("request_timeout", &nanosrv::Manager::request_timeout);
 
     // -----------------------------------------------------------------------
     // ShardedManager (multi-threaded event loop)
@@ -431,6 +437,10 @@ NB_MODULE(_core, m) {
              "ms"_a,
              "Close accepted connections idle for `ms` ms on every worker. "
              "Set before run(). 0 disables (the default).")
+        .def("set_request_timeout",
+             &nanosrv::ShardedManager::set_request_timeout, "ms"_a,
+             "Request-receive deadline (ms) on every worker. Set before run(). "
+             "0 disables (the default).")
         .def_prop_ro("num_workers", &nanosrv::ShardedManager::num_workers);
 
     // -----------------------------------------------------------------------
