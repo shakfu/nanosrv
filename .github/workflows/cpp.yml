@@ -1,0 +1,76 @@
+name: C++ (sanitizers + fuzz)
+
+# Builds and tests the C++ core -- which the existing CI workflows never do.
+# Job 1 runs the C++ unit suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+# Job 2 builds the libFuzzer targets and runs each for a short, bounded smoke run.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  sanitize:
+    name: Unit tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+      # Fail on leaks too; print readable traces.
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build
+
+      - name: Configure (NANOSRV_SANITIZE=ON)
+        run: cmake -B build/asan -S projects -G Ninja -DNANOSRV_SANITIZE=ON
+
+      - name: Build
+        run: cmake --build build/asan
+
+      - name: Run unit tests under sanitizers
+        run: ctest --test-dir build/asan -R unit_tests --output-on-failure
+
+  fuzz:
+    name: Fuzz smoke (libFuzzer)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build
+
+      - name: Configure (NANOSRV_FUZZ=ON)
+        run: cmake -B build/fuzz -S projects -G Ninja -DNANOSRV_FUZZ=ON
+
+      - name: Build fuzz targets
+        run: cmake --build build/fuzz --target fuzz_http fuzz_ws fuzz_dns
+
+      - name: Fuzz http (60s, seeded)
+        run: ./build/fuzz_http -max_total_time=60 -error_exitcode=1 tests/fuzz/corpus/http
+
+      - name: Fuzz ws (60s, seeded)
+        run: ./build/fuzz_ws -max_total_time=60 -error_exitcode=1 tests/fuzz/corpus/ws
+
+      - name: Fuzz dns (60s, seeded)
+        run: ./build/fuzz_dns -max_total_time=60 -error_exitcode=1 tests/fuzz/corpus/dns
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore
+          retention-days: 14

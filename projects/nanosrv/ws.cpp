@@ -309,4 +309,17 @@ size_t ws_wrap(struct Connection* c, size_t len, int op)
     return c->send.len;
 }
 
+#ifdef NANOSRV_EXPOSE_INTERNALS
+// Test/fuzz-only entry point exposing the internal WebSocket frame parser.
+// ws_process() is static and operates on the internal ws_msg struct, so it
+// cannot be reached from a separate translation unit without this wrapper.
+// Defined here (same TU) so it can see the static symbol. Declared in the
+// fuzz harness via an extern declaration. Not compiled in normal builds.
+size_t ws_process_for_test(uint8_t* buf, size_t len)
+{
+    struct ws_msg msg;
+    return ws_process(buf, len, &msg);
+}
+#endif
+
 } // namespace nanosrv

@@ -131,9 +131,12 @@ static void test_manager_raii()
 
 static void test_type_safe_callback_general()
 {
-    // General handler with Event enum (no int cast needed)
-    Manager mgr;
+    // General handler with Event enum (no int cast needed).
+    // handler_called must be declared before mgr: mgr_free() runs a final
+    // poll during destruction that can deliver a Poll event into this handler,
+    // so the captured local has to outlive the Manager.
     bool handler_called = false;
+    Manager mgr;
 
     auto c = mgr.http_listen("http://127.0.0.1:0",
         HandlerFn([&handler_called](Connection& conn, Event ev, [[maybe_unused]] void* data) {
@@ -149,8 +152,9 @@ static void test_type_safe_callback_general()
 static void test_typed_http_handler()
 {
     // Typed HTTP handler: receives HttpMessage& directly, no casting
-    Manager mgr;
+    // got_request must outlive mgr (mgr_free() polls during destruction).
     bool got_request = false;
+    Manager mgr;
 
     auto listener = mgr.http_listen("http://127.0.0.1:0",
         Manager::HttpHandler([&got_request](Connection& c, HttpMessage& hm) {
@@ -330,8 +334,9 @@ static void test_str_constructors()
 
 static void test_connection_send_bytes()
 {
-    Manager mgr;
+    // sent_ok must outlive mgr: mgr_free()'s teardown poll can fire this handler.
     bool sent_ok = false;
+    Manager mgr;
 
     auto c = mgr.http_listen("http://127.0.0.1:0",
         HandlerFn([&sent_ok](Connection& conn, Event ev, [[maybe_unused]] void* data) {
