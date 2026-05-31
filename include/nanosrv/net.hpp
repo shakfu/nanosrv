@@ -100,6 +100,10 @@ struct Mgr {
     struct DnsConfig dns4;
     struct DnsConfig dns6;
     int dnstimeout;
+    // Idle timeout in milliseconds for accepted connections. 0 = disabled.
+    // An accepted connection with no read/write activity for this long is
+    // closed by the event loop (defends against connect-and-idle exhaustion).
+    int idle_timeout_ms;
     bool use_dns6;
     unsigned long nextid;
     void* userdata;
@@ -123,6 +127,7 @@ struct Connection {
     struct Address rem;
     void* fd;
     unsigned long id;
+    uint64_t last_active;  // millis() of last I/O; used for idle timeout
     struct IOBuffer recv;
     struct IOBuffer send;
     struct IOBuffer prof;
@@ -272,6 +277,13 @@ public:
     // Wakeup a connection by ID
     void wakeup(unsigned long conn_id, std::string_view data = {});
 
+    // Idle timeout (ms) for accepted connections; 0 disables it (the default).
+    // An accepted connection with no read/write activity for this long is closed
+    // on the next poll. Note: this also reaps idle established connections such
+    // as WebSockets, so those should use application-level keepalive (ping/pong).
+    void set_idle_timeout(int ms) { mgr_.idle_timeout_ms = ms; }
+    int idle_timeout() const { return mgr_.idle_timeout_ms; }
+
 private:
     struct Mgr mgr_;
 };
@@ -300,6 +312,13 @@ public:
 
     // Signal all workers to stop (call from signal handler or another thread).
     void stop();
+
+    // Idle timeout (ms) for accepted connections, applied to every worker.
+    // Set before run() so the value is visible to worker threads without a race.
+    void set_idle_timeout(int ms) {
+        for (auto& w : workers_)
+            w->set_idle_timeout(ms);
+    }
 
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }
 

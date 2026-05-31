@@ -438,6 +438,50 @@ static void test_sharded_concurrent_requests()
     assert(served.load() == num_clients);
 }
 
+// Connection idle timeout: an accepted connection that sends nothing must be
+// closed by the event loop after the configured idle period. Defends against
+// connect-and-idle resource exhaustion.
+static void test_idle_timeout()
+{
+    // closed must outlive mgr (mgr_free()'s teardown poll can fire the handler).
+    std::atomic<int> closed{0};
+    Manager mgr;
+    mgr.set_idle_timeout(150);  // ms
+    assert(mgr.idle_timeout() == 150);
+
+    auto ref = mgr.http_listen("http://127.0.0.1:18892",
+        HandlerFn([&closed](Connection&, Event ev, void*) {
+            if (ev == Event::Close)
+                closed.fetch_add(1, std::memory_order_relaxed);
+        }));
+    assert(ref);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(18892);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+
+    // Drive the loop; the client never sends, so the server must close it.
+    // Poll for up to ~2s (well beyond the 150ms timeout) checking for EOF.
+    bool server_closed = false;
+    for (int i = 0; i < 100 && !server_closed; i++) {
+        mgr.poll(20ms);
+        char buf[16];
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 0)
+            server_closed = true;  // orderly shutdown: server closed the conn
+        else
+            std::this_thread::sleep_for(10ms);
+    }
+    close(fd);
+
+    assert(server_closed);          // the idle connection was reaped
+    assert(closed.load() >= 1);     // and a Close event fired for it
+}
+
 // H3 Stage B: the destructor must shut down an in-flight run() (possibly on
 // another thread) on its own -- without an explicit stop()/join beforehand --
 // rather than racing teardown against the running loops.
@@ -496,6 +540,7 @@ int main()
     }
 
 #ifndef _WIN32
+    test_idle_timeout();
     test_sharded_concurrent_requests();
     test_sharded_destructor_stops_run();
 #endif

@@ -415,6 +415,38 @@ class TestCallbackObjectLifetime:
             mgr.poll(0)
             del mgr
 
+    def test_idle_timeout_closes_silent_connection(self):
+        # An accepted connection that sends nothing must be reaped after the
+        # idle timeout. We connect a raw socket, send nothing, and expect the
+        # server to close it (recv returns b"" / EOF).
+        import socket
+
+        mgr = nanosrv.Manager()
+        mgr.set_idle_timeout(150)
+        assert mgr.idle_timeout == 150
+        mgr.http_listen("http://127.0.0.1:18360",
+                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(20)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.05)
+            s = socket.create_connection(("127.0.0.1", 18360), timeout=2)
+            s.settimeout(2.0)
+            # Send nothing; the server should close the idle connection.
+            data = s.recv(16)  # blocks until server closes -> returns b""
+            s.close()
+            assert data == b"", f"expected server to close idle conn, got {data!r}"
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
     def test_callback_is_released_when_listener_closes(self):
         # H1 regression: the listener must hold the callback while open and
         # release it when the Manager is destroyed. The previous binding leaked

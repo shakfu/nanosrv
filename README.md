@@ -12,6 +12,7 @@ nanosrv is a lightweight, single-file C++ server library (based on [Mongoose](ht
 - **URL parsing**, **Base64** encode/decode, **URL** encode/decode
 - **JSON** path-based extraction (string, number, integer, boolean)
 - **Configurable logging** levels
+- **Idle connection timeout** (`set_idle_timeout(ms)`) to reap silent/idle accepted connections
 - GIL-releasing `poll()` and `run()` for responsive Python integration
 
 ## Server Implementations
@@ -24,8 +25,8 @@ The project provides six server implementations: five built on the nanosrv netwo
 |---|---|---|---|---|
 | **mongoose 7.21** | C | Single-threaded | `mg_mgr_poll()` loop | `thirdparty/mongoose/main.c` |
 | **mungo-server** | C | Single-threaded | `mg_mgr_poll()` loop | `projects/mungo/main.c` |
-| **nanosrv-server** | C++ | Single-threaded | `Manager::poll()` loop | `server/main.cpp` |
-| **nanosrv-sharded** | C++ | Multi-threaded (accept-and-hand-off) | 1 acceptor + N worker `Manager` loops | `server/main_sharded.cpp` |
+| **nanosrv-server** | C++ | Single-threaded | `Manager::poll()` loop | `projects/nanosrv-exe/main.cpp` |
+| **nanosrv-sharded** | C++ | Multi-threaded (accept-and-hand-off) | 1 acceptor + N worker `Manager` loops | `projects/nanosrv-sharded/main_sharded.cpp` |
 | **nanosrv Python Manager** | Python (nanobind) | Single-threaded | `Manager.poll()` from Python | `nanosrv.Manager` |
 | **nanosrv Python ShardedManager** | Python (nanobind) | Multi-threaded | `ShardedManager.run()` from Python | `nanosrv.ShardedManager` |
 

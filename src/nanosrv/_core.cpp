@@ -389,7 +389,12 @@ NB_MODULE(_core, m) {
              "called for every event.")
         .def("wakeup", &nanosrv::Manager::wakeup,
              "conn_id"_a, "data"_a = std::string_view{},
-             "Wakeup a connection by ID.");
+             "Wakeup a connection by ID.")
+        .def("set_idle_timeout", &nanosrv::Manager::set_idle_timeout, "ms"_a,
+             "Close accepted connections idle (no I/O) for `ms` milliseconds. "
+             "0 disables (the default). Also reaps idle WebSockets, so use "
+             "application keepalive for those.")
+        .def_prop_ro("idle_timeout", &nanosrv::Manager::idle_timeout);
 
     // -----------------------------------------------------------------------
     // ShardedManager (multi-threaded event loop)
@@ -422,6 +427,10 @@ NB_MODULE(_core, m) {
         }, "Start worker threads and acceptor loop. Blocks until stop().")
         .def("stop", &nanosrv::ShardedManager::stop,
              "Signal all workers to stop.")
+        .def("set_idle_timeout", &nanosrv::ShardedManager::set_idle_timeout,
+             "ms"_a,
+             "Close accepted connections idle for `ms` ms on every worker. "
+             "Set before run(). 0 disables (the default).")
         .def_prop_ro("num_workers", &nanosrv::ShardedManager::num_workers);
 
     // -----------------------------------------------------------------------

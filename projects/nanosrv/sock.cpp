@@ -122,6 +122,7 @@ static void iolog(struct Connection* c, char* buf, long n, bool r)
     } else if (n <= 0) {
         c->is_closing = 1; // Termination. Don't call error(): #1529
     } else if (n > 0) {
+        c->last_active = millis();  // record I/O activity for idle timeout
         if (c->is_hexdumping) {
             MG_INFO(("\n-- %lu %M %s %M %ld", c->id, print_ip_port, &c->loc,
                      r ? "<-" : "->", print_ip_port, &c->rem, n));
@@ -1009,6 +1010,12 @@ void mgr_poll(struct Mgr* mgr, int ms)
         }
 
         if (c->is_draining && c->send.len == 0)
+            c->is_closing = 1;
+        // Idle timeout: reap accepted connections with no recent I/O. Scoped to
+        // accepted connections so internal connections (e.g. the wakeup pipe)
+        // and client-initiated connections are never reaped.
+        if (mgr->idle_timeout_ms > 0 && c->is_accepted && !c->is_closing
+            && now - c->last_active > (uint64_t)mgr->idle_timeout_ms)
             c->is_closing = 1;
         if (c->is_closing)
             sock_close(c);

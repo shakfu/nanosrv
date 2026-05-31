@@ -182,6 +182,7 @@ struct Connection* alloc_conn(struct Mgr* mgr)
     c->mgr = mgr;
     c->send.align = c->recv.align = c->rtls.align = MG_IO_SIZE;
     c->id = ++mgr->nextid;
+    c->last_active = millis();  // start the idle clock at creation
     MG_PROF_INIT(c);
     return c;
 }
