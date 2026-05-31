@@ -533,6 +533,61 @@ static void test_request_timeout()
     assert(closed.load() >= 1);
 }
 
+// Request-body cap: a request advertising a Content-Length over the cap must be
+// rejected with 413 before its body is buffered, and the user handler must not
+// be invoked for it.
+static void test_max_body_size()
+{
+    std::atomic<int> served{0};
+    Manager mgr;
+    mgr.set_max_body_size(1024);  // 1 KB cap
+    assert(mgr.max_body_size() == 1024);
+
+    auto ref = mgr.http_listen("http://127.0.0.1:18894",
+        HandlerFn([&served](Connection& c, Event ev, void*) {
+            if (ev == Event::HttpMessage) {
+                served.fetch_add(1, std::memory_order_relaxed);
+                http_reply(&c, 200, "", "ok");
+            }
+        }));
+    assert(ref);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(18894);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+
+    // Advertise an oversized body; send only the headers (no body bytes). The
+    // server must reject on the declared Content-Length alone.
+    const char* req =
+        "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n";
+    assert(send(fd, req, strlen(req), 0) > 0);
+
+    bool got_413 = false, got_200 = false;
+    for (int i = 0; i < 60 && !got_413; i++) {
+        mgr.poll(20ms);
+        char buf[512];
+        ssize_t n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+        if (n > 0) {
+            buf[n] = '\0';
+            if (strstr(buf, "413"))
+                got_413 = true;
+            if (strstr(buf, " 200 "))
+                got_200 = true;
+        } else {
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    close(fd);
+
+    assert(got_413);                 // rejected with 413
+    assert(!got_200);                // never served a 200
+    assert(served.load() == 0);      // handler never saw the oversized request
+}
+
 // H3 Stage B: the destructor must shut down an in-flight run() (possibly on
 // another thread) on its own -- without an explicit stop()/join beforehand --
 // rather than racing teardown against the running loops.
@@ -593,6 +648,7 @@ int main()
 #ifndef _WIN32
     test_idle_timeout();
     test_request_timeout();
+    test_max_body_size();
     test_sharded_concurrent_requests();
     test_sharded_destructor_stops_run();
 #endif

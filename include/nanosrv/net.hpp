@@ -109,6 +109,11 @@ struct Mgr {
     // completed it within this window is closed (defends against slow-dribble
     // slowloris, which keeps the idle timer alive by trickling bytes).
     int request_timeout_ms;
+    // Maximum request body size in bytes for accepted connections. 0 = disabled.
+    // A request whose Content-Length (or de-chunked body) exceeds this is
+    // rejected with 413; an oversized Content-Length is rejected before the body
+    // is buffered.
+    size_t max_body_size;
     bool use_dns6;
     unsigned long nextid;
     void* userdata;
@@ -298,6 +303,13 @@ public:
     void set_request_timeout(int ms) { mgr_.request_timeout_ms = ms; }
     int request_timeout() const { return mgr_.request_timeout_ms; }
 
+    // Maximum request body size in bytes for accepted connections; 0 disables
+    // it (the default). A request advertising a larger Content-Length is
+    // rejected with 413 before its body is buffered; a chunked body exceeding
+    // the cap is rejected after de-chunking.
+    void set_max_body_size(size_t bytes) { mgr_.max_body_size = bytes; }
+    size_t max_body_size() const { return mgr_.max_body_size; }
+
 private:
     struct Mgr mgr_;
 };
@@ -338,6 +350,12 @@ public:
     void set_request_timeout(int ms) {
         for (auto& w : workers_)
             w->set_request_timeout(ms);
+    }
+
+    // Maximum request body size (bytes), applied to every worker. Set before run().
+    void set_max_body_size(size_t bytes) {
+        for (auto& w : workers_)
+            w->set_max_body_size(bytes);
     }
 
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }

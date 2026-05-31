@@ -482,6 +482,57 @@ class TestCallbackObjectLifetime:
             stop.set()
             t.join(timeout=2)
 
+    def test_max_body_size_rejects_with_413(self):
+        # An oversized Content-Length must get a 413 (and never reach the
+        # handler), while a body under the cap is served normally.
+        import urllib.error
+
+        mgr = nanosrv.Manager()
+        mgr.set_max_body_size(1024)
+        assert mgr.max_body_size == 1024
+        served = {"n": 0}
+
+        def handler(conn, msg):
+            served["n"] += 1
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://127.0.0.1:18363", handler)
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(20)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.05)
+
+            # Oversized body -> 413, handler not invoked.
+            req = urllib.request.Request(
+                "http://127.0.0.1:18363/big",
+                data=b"x" * 5000,
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(req)
+                assert False, "expected HTTP 413"
+            except urllib.error.HTTPError as e:
+                assert e.code == 413, f"expected 413, got {e.code}"
+
+            # Small body under the cap -> served.
+            small = urllib.request.Request(
+                "http://127.0.0.1:18363/ok",
+                data=b"hello",
+                method="POST",
+            )
+            resp = urllib.request.urlopen(small)
+            assert resp.read() == b"ok"
+            assert served["n"] == 1  # only the small request reached the handler
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
     def test_callback_is_released_when_listener_closes(self):
         # H1 regression: the listener must hold the callback while open and
         # release it when the Manager is destroyed. The previous binding leaked

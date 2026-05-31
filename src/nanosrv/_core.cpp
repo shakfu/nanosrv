@@ -400,7 +400,13 @@ NB_MODULE(_core, m) {
              "Close accepted connections that buffer a partial request without "
              "completing it within `ms` milliseconds (slow-dribble defense). "
              "0 disables (the default). Set generously for large uploads.")
-        .def_prop_ro("request_timeout", &nanosrv::Manager::request_timeout);
+        .def_prop_ro("request_timeout", &nanosrv::Manager::request_timeout)
+        .def("set_max_body_size", &nanosrv::Manager::set_max_body_size,
+             "bytes"_a,
+             "Reject request bodies larger than `bytes` with HTTP 413. An "
+             "oversized Content-Length is rejected before the body is buffered. "
+             "0 disables (the default).")
+        .def_prop_ro("max_body_size", &nanosrv::Manager::max_body_size);
 
     // -----------------------------------------------------------------------
     // ShardedManager (multi-threaded event loop)
@@ -441,6 +447,10 @@ NB_MODULE(_core, m) {
              &nanosrv::ShardedManager::set_request_timeout, "ms"_a,
              "Request-receive deadline (ms) on every worker. Set before run(). "
              "0 disables (the default).")
+        .def("set_max_body_size",
+             &nanosrv::ShardedManager::set_max_body_size, "bytes"_a,
+             "Maximum request body size (bytes) on every worker; larger bodies "
+             "get HTTP 413. Set before run(). 0 disables (the default).")
         .def_prop_ro("num_workers", &nanosrv::ShardedManager::num_workers);
 
     // -----------------------------------------------------------------------

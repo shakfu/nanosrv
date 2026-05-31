@@ -12,7 +12,8 @@ nanosrv is a lightweight, single-file C++ server library (based on [Mongoose](ht
 - **URL parsing**, **Base64** encode/decode, **URL** encode/decode
 - **JSON** path-based extraction (string, number, integer, boolean)
 - **Configurable logging** levels
-- **Idle connection timeout** (`set_idle_timeout(ms)`) to reap silent/idle accepted connections
+- **Connection hardening**: idle timeout (`set_idle_timeout`), request-receive deadline
+  (`set_request_timeout`), and request-body cap with 413 (`set_max_body_size`)
 - GIL-releasing `poll()` and `run()` for responsive Python integration
 
 ## Server Implementations

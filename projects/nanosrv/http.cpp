@@ -660,6 +660,18 @@ void http_cb(struct Connection* c, int ev, void* ev_data)
                 }
             }
 
+            // Reject an oversized request body. For a declared Content-Length
+            // (non-chunked) this fires before the body is buffered, so an absurd
+            // advertised length costs nothing. Chunked bodies have no declared
+            // length here and are checked after de-chunking, below.
+            if (c->mgr->max_body_size > 0 && c->is_accepted && !is_chunked
+                && hm.body.len > c->mgr->max_body_size) {
+                http_reply(c, 413, "", "");
+                c->recv.len = 0;  // discard the rejected request so the close
+                c->is_draining = 1;  // path does not re-deliver it as a message
+                return;
+            }
+
             if (is_chunked) {
                 // For chunked data, strip off prefixes and suffixes from
                 // chunks and relocate them right after the headers, then
@@ -686,6 +698,14 @@ void http_cb(struct Connection* c, int ev, void* ev_data)
                         hm.message.len += static_cast<size_t>(dl);
                     if (dl == 0)
                         break;
+                }
+                // Enforce the body cap on the fully de-chunked body.
+                if (c->mgr->max_body_size > 0 && c->is_accepted
+                    && hm.body.len > c->mgr->max_body_size) {
+                    http_reply(c, 413, "", "");
+                    c->recv.len = 0;     // discard so close doesn't re-deliver
+                    c->is_draining = 1;
+                    return;
                 }
                 ofs += static_cast<size_t>(n + o);
             } else { // Normal, non-chunked data
