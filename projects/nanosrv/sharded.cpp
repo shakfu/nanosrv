@@ -1,11 +1,12 @@
 #include "nanosrv/nanosrv.hpp"
-#include <chrono>
 #include <mutex>
 #include <queue>
-
-using namespace std::chrono_literals;
+#include <thread>
+#include <vector>
 
 namespace nanosrv {
+
+using HttpHandler = Manager::HttpHandler;
 
 // Pending connection: FD + addresses stolen from the acceptor.
 struct PendingConn {
@@ -19,6 +20,57 @@ struct WorkerQueue {
     std::mutex mu;
     std::queue<PendingConn> pending;
 };
+
+// Sentinel id used only to wake a worker/acceptor poll(); it intentionally
+// matches no real connection, so wufn() consumes it and returns (see sock.cpp).
+static constexpr unsigned long WAKE_ID = 1;
+
+// Interrupt a manager's poll() from another thread. No-op until wakeup_init()
+// has set up the pipe. wakeup() does a socket send(), which is thread-safe.
+static void wake_mgr(Mgr* mgr)
+{
+    if (mgr->pipe != MG_INVALID_SOCKET)
+        wakeup(mgr, WAKE_ID, "", 0);
+}
+
+// Adopt every FD currently queued for this worker into its event loop. Runs on
+// the worker thread only. Each adopted connection gets its own copy of the
+// user's handler as fn_data and the HTTP protocol handler as pfn.
+static void drain_worker(Mgr* mgr, WorkerQueue* q, const HttpHandler& handler)
+{
+    for (;;) {
+        PendingConn pc;
+        {
+            std::lock_guard<std::mutex> lock(q->mu);
+            if (q->pending.empty())
+                break;
+            pc = q->pending.front();
+            q->pending.pop();
+        }
+
+        auto* handler_copy = new HttpHandler(handler);
+        auto* c = wrapfd(mgr, static_cast<int>(pc.fd),
+            [](Connection* c, int ev, void* ev_data) {
+                auto* fn = static_cast<HttpHandler*>(c->fn_data);
+                if (ev == MG_EV_HTTP_MSG)
+                    (*fn)(*c, *static_cast<HttpMessage*>(ev_data));
+                if (ev == MG_EV_CLOSE) {
+                    delete static_cast<HttpHandler*>(c->fn_data);
+                    c->fn_data = nullptr;
+                }
+            },
+            handler_copy);
+        if (c) {
+            c->rem = pc.rem;
+            c->loc = pc.loc;
+            c->is_accepted = 1;
+            c->pfn = http_cb;
+        } else {
+            delete handler_copy;
+            close(static_cast<int>(pc.fd));
+        }
+    }
+}
 
 ShardedManager::ShardedManager(unsigned num_threads)
 {
@@ -35,144 +87,119 @@ ShardedManager::ShardedManager(unsigned num_threads)
 ShardedManager::~ShardedManager()
 {
     stop();
+    // Wait for an in-flight run() (possibly on another thread) to finish before
+    // members are destroyed. run() clears its threads and sets run_active_ false
+    // as its last act, after which it touches no members.
+    while (run_active_.load(std::memory_order_acquire))
+        std::this_thread::yield();
 }
 
 void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
 {
-    // Shared handler and per-worker queues
-    auto shared_handler = std::make_shared<HttpHandler>(std::move(handler));
     auto queues = std::make_shared<std::vector<WorkerQueue>>(workers_.size());
     queues_ = queues;
-    handler_ = shared_handler;
+    handler_ = std::make_shared<HttpHandler>(std::move(handler));
 
+    // Raw worker manager pointers for cross-thread wakeups. Valid as long as
+    // this ShardedManager (hence workers_) is alive, which outlives the acceptor.
+    std::vector<Mgr*> worker_mgrs;
+    worker_mgrs.reserve(workers_.size());
+    for (auto& w : workers_)
+        worker_mgrs.push_back(w->raw());
+
+    const unsigned num_workers = static_cast<unsigned>(workers_.size());
+    std::atomic<unsigned>* next = &next_;
     std::string url_str(url);
 
-    // Set up a timer on each worker that drains its queue every 1ms.
-    // Adopted FDs get the HTTP protocol handler and the user's callback.
-    for (size_t i = 0; i < workers_.size(); i++) {
-        auto* mgr_raw = workers_[i]->raw();
-        auto* q = &(*queues)[i];
-        auto h = shared_handler;
-
-        // Typed HTTP trampoline for adopted connections.
-        // Each adopted connection gets its own copy of fn/fn_data.
-        struct AdoptCtx {
-            std::shared_ptr<HttpHandler> handler;
-            WorkerQueue* queue;
-            Mgr* mgr;
-        };
-
-        auto ctx = std::make_shared<AdoptCtx>(AdoptCtx{h, q, mgr_raw});
-        listen_state_.push_back(ctx);  // own it; freed in ~ShardedManager
-
-        // Use a timer (1ms repeat) to drain the queue. The timer holds a raw
-        // (non-owning) pointer; the manager owns the AdoptCtx via listen_state_.
-        timer_add(mgr_raw, 1, MG_TIMER_REPEAT,
-            [](void* arg) {
-                auto* ctx = static_cast<AdoptCtx*>(arg);
-                PendingConn pc;
-                for (;;) {
-                    {
-                        std::lock_guard<std::mutex> lock(ctx->queue->mu);
-                        if (ctx->queue->pending.empty()) break;
-                        pc = ctx->queue->pending.front();
-                        ctx->queue->pending.pop();
-                    }
-                    // Adopt the FD into this worker's event loop.
-                    // http_handler_adopt sets up the HTTP protocol handler
-                    // and the user's callback.
-                    auto* handler_copy = new HttpHandler(*ctx->handler);
-                    auto* c = wrapfd(ctx->mgr, static_cast<int>(pc.fd),
-                        [](Connection* c, int ev, void* ev_data) {
-                            auto* fn = static_cast<HttpHandler*>(c->fn_data);
-                            if (ev == MG_EV_HTTP_MSG) {
-                                (*fn)(*c, *static_cast<HttpMessage*>(ev_data));
-                            }
-                            if (ev == MG_EV_CLOSE) {
-                                delete static_cast<HttpHandler*>(c->fn_data);
-                                c->fn_data = nullptr;
-                            }
-                        },
-                        handler_copy);
-                    if (c) {
-                        c->rem = pc.rem;
-                        c->loc = pc.loc;
-                        c->is_accepted = 1;
-                        c->pfn = http_cb;
-                    } else {
-                        delete handler_copy;
-                        close(static_cast<int>(pc.fd));
-                    }
-                }
-            },
-            ctx.get());
-    }
-
-    // The acceptor listens on the URL. On MG_EV_ACCEPT, steal the FD
-    // and push it to a worker queue round-robin.
-    struct AcceptCtx {
-        std::shared_ptr<std::vector<WorkerQueue>> queues;
-        std::atomic<unsigned>* next;
-        unsigned num_workers;
-    };
-    auto actx = std::make_shared<AcceptCtx>(
-        AcceptCtx{queues, &next_, static_cast<unsigned>(workers_.size())});
-    auto* actx_raw = actx.get();
-    listen_state_.push_back(actx);  // own it; freed in ~ShardedManager
-
+    // The acceptor listens on the URL. On MG_EV_ACCEPT, steal the FD, hand it to
+    // a worker queue round-robin, and wake that worker. All state is captured by
+    // value in the std::function (owned by the acceptor's listener connection),
+    // so there is nothing to leak.
     acceptor_.http_listen(url_str,
-        HandlerFn([actx_raw](Connection& c, Event ev, void*) {
-            auto* actx = actx_raw;  // non-owning; manager owns via listen_state_
-            if (ev == Event::Accept) {
-                // Steal the FD from the accepted connection
-                Address rem = c.rem;
-                Address loc = c.loc;
-                MG_SOCKET_TYPE fd = detach_fd(&c);
-                c.is_closing = 1;  // Tell the event loop to clean up this connection
+        HandlerFn([queues, next, num_workers, worker_mgrs](
+                      Connection& c, Event ev, void*) {
+            if (ev != Event::Accept)
+                return;  // accepted conns are detached/closed; ignore the rest
 
-                if (fd != MG_INVALID_SOCKET) {
-                    // Round-robin to a worker
-                    unsigned idx = actx->next->fetch_add(1, std::memory_order_relaxed)
-                                   % actx->num_workers;
-                    auto& q = (*actx->queues)[idx];
-                    std::lock_guard<std::mutex> lock(q.mu);
-                    q.pending.push({fd, rem, loc});
-                }
+            Address rem = c.rem;
+            Address loc = c.loc;
+            MG_SOCKET_TYPE fd = detach_fd(&c);
+            c.is_closing = 1;  // let the acceptor loop clean up this connection
+            if (fd == MG_INVALID_SOCKET)
+                return;
+
+            unsigned idx =
+                next->fetch_add(1, std::memory_order_relaxed) % num_workers;
+            {
+                std::lock_guard<std::mutex> lock((*queues)[idx].mu);
+                (*queues)[idx].pending.push({fd, rem, loc});
             }
-            // Ignore other events on accepted connections (they'll be closed)
+            wake_mgr(worker_mgrs[idx]);  // drain promptly instead of on a timer
         }));
 }
 
 void ShardedManager::run()
 {
-    running_ = true;
+    run_active_.store(true, std::memory_order_release);
+    running_.store(true);
 
-    // Start worker threads
+    // Cross-thread wakeup pipes must exist before any thread polls. Created on
+    // this thread before workers start, so there is no concurrent access.
+    for (auto& w : workers_)
+        wakeup_init(w->raw());
+    wakeup_init(acceptor_.raw());
+
+    // One worker thread per worker Manager. Each drains its queue, then polls;
+    // the poll wakes immediately when the acceptor hands off (wake_mgr) and
+    // otherwise after the fallback timeout.
     threads_.reserve(workers_.size());
-    for (auto& worker : workers_) {
-        threads_.emplace_back([this, &worker]() {
-            while (running_) {
-                worker->poll(5ms);
+    for (size_t i = 0; i < workers_.size(); i++) {
+        Manager* w = workers_[i].get();
+        auto queues = queues_;
+        auto handler = handler_;
+        threads_.emplace_back([this, w, queues, handler, i]() {
+            while (running_.load()) {
+                if (queues && handler)
+                    drain_worker(w->raw(), &(*queues)[i], *handler);
+                w->poll(1000);
             }
         });
     }
 
-    // Acceptor runs on the calling thread
-    while (running_) {
-        acceptor_.poll(5ms);
-    }
+    // Acceptor runs on the calling thread.
+    while (running_.load())
+        acceptor_.poll(1000);
 
-    // Join all worker threads before returning
-    for (auto& t : threads_) {
+    // Stop and join workers before returning.
+    for (auto& w : workers_)
+        wake_mgr(w->raw());
+    for (auto& t : threads_)
         if (t.joinable())
             t.join();
-    }
     threads_.clear();
+
+    // Close any FDs still queued at shutdown -- no worker will adopt them now.
+    if (queues_) {
+        for (auto& q : *queues_) {
+            std::lock_guard<std::mutex> lock(q.mu);
+            while (!q.pending.empty()) {
+                close(static_cast<int>(q.pending.front().fd));
+                q.pending.pop();
+            }
+        }
+    }
+
+    run_active_.store(false, std::memory_order_release);
 }
 
 void ShardedManager::stop()
 {
-    running_ = false;
+    running_.store(false);
+    // Wake the acceptor and workers so their polls return promptly instead of
+    // waiting out the fallback timeout.
+    for (auto& w : workers_)
+        wake_mgr(w->raw());
+    wake_mgr(acceptor_.raw());
 }
 
 } // namespace nanosrv

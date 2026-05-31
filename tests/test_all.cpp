@@ -437,6 +437,28 @@ static void test_sharded_concurrent_requests()
     assert(ok_count.load() == num_clients);
     assert(served.load() == num_clients);
 }
+
+// H3 Stage B: the destructor must shut down an in-flight run() (possibly on
+// another thread) on its own -- without an explicit stop()/join beforehand --
+// rather than racing teardown against the running loops.
+static void test_sharded_destructor_stops_run()
+{
+    std::thread runner;
+    {
+        ShardedManager sharded(2);
+        sharded.http_listen("http://127.0.0.1:18891",
+            [](Connection& c, HttpMessage&) {
+                http_reply(&c, 200, "", "ok");
+            });
+        runner = std::thread([&sharded]() { sharded.run(); });
+        std::this_thread::sleep_for(100ms);
+        (void)http_get_200(18891);  // prove it served at least one request
+        // No explicit stop() or join here: leaving this scope destroys `sharded`,
+        // and ~ShardedManager must stop run() and wait for it to finish.
+    }
+    // By now run() has returned (the destructor waited), so this join is immediate.
+    runner.join();
+}
 #endif  // _WIN32
 
 int main()
@@ -475,6 +497,7 @@ int main()
 
 #ifndef _WIN32
     test_sharded_concurrent_requests();
+    test_sharded_destructor_stops_run();
 #endif
 
     puts("All tests passed");
