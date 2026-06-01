@@ -39,12 +39,21 @@ nice-to-have.
 
 ## P2 -- Robustness & production-readiness
 
-- [ ] **Per-connection / max-connection limits.** No cap on accepted connections
-  and no per-connection send backpressure beyond the 3 MB recv ceiling; a slow
-  reader can tie up send buffering. Add a configurable max-connection cap and a
-  backpressure policy.
-- [ ] **Graceful shutdown / drain.** `stop()` is abrupt; there is no "stop
-  accepting, finish in-flight requests, then exit" path. Add a drain mode.
+- [x] **Per-connection / max-connection limits.** Added `set_max_connections(n)`
+  (single-`Manager` cap enforced in `accept_conn`; global-across-workers cap on
+  `ShardedManager` enforced at the acceptor via a shared atomic) and
+  `set_max_send_buffer(bytes)`, a close-over-watermark backpressure policy that
+  drops a slow reader once its unsent outbound backlog exceeds the cap. Exposed
+  in the Python bindings and as opt-in CLI flags; covered by C++ and Python tests
+  and verified clean under TSAN and ASAN/UBSan.
+- [x] **Graceful shutdown / drain.** Added `ShardedManager::drain(timeout_ms)`
+  (stop accepting at the acceptor, let workers finish flushing in-flight
+  responses via per-connection `is_draining`, then return from `run()`; force
+  close anything still open past the timeout) and `Manager::start_drain()` for
+  the single-threaded loop. Exposed in the Python bindings and as a
+  `--drain-timeout` flag on both executables. Covered by C++ and Python tests
+  and verified clean under TSAN and ASAN/UBSan; the TSAN run also surfaced and
+  fixed a pre-existing wakeup-pipe race in `stop()`/`drain()`.
 - [ ] **Python version matrix mismatch** (`pyproject.toml` requires `>=3.10` but
   `.github/workflows/ci-py.yml` matrix and `build-publish.yml` `CIBW_BUILD` build
   cp39). Align the matrix and `CIBW_BUILD` with `requires-python`.

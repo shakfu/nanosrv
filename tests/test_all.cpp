@@ -609,6 +609,236 @@ static void test_sharded_destructor_stops_run()
     // By now run() has returned (the destructor waited), so this join is immediate.
     runner.join();
 }
+
+// Max-connection cap (single Manager): once the live accepted-connection count
+// reaches the cap, further accepted sockets are closed immediately instead of
+// adopted. Closing an accepted connection must free a slot for a new one.
+static void test_max_connections()
+{
+    Manager mgr;
+    mgr.set_max_connections(2);
+    assert(mgr.max_connections() == 2);
+
+    auto ref = mgr.http_listen("http://127.0.0.1:18895",
+        HandlerFn([](Connection&, Event, void*) {}));
+    assert(ref);
+
+    auto dial = []() {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        struct sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(18895);
+        sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+        assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
+                       sizeof(sa)) == 0);
+        return fd;
+    };
+    auto is_eof = [](int fd) {
+        char buf[8];
+        return recv(fd, buf, sizeof(buf), MSG_DONTWAIT) == 0;
+    };
+
+    // Three idle clients against a cap of two: the third is rejected.
+    int a = dial(), b = dial(), c = dial();
+    for (int i = 0; i < 40; i++) mgr.poll(20ms);
+
+    assert(mgr.num_connections() == 2);  // cap held, third not adopted
+    int eofs = (is_eof(a) ? 1 : 0) + (is_eof(b) ? 1 : 0) + (is_eof(c) ? 1 : 0);
+    assert(eofs == 1);                   // exactly one was dropped
+
+    // Close all clients; the server must account every close back to zero.
+    close(a); close(b); close(c);
+    for (int i = 0; i < 40; i++) mgr.poll(20ms);
+    assert(mgr.num_connections() == 0);
+
+    // A slot is free again, so a fresh connection is accepted.
+    int d = dial();
+    for (int i = 0; i < 40; i++) mgr.poll(20ms);
+    assert(mgr.num_connections() == 1);
+    close(d);
+    for (int i = 0; i < 20; i++) mgr.poll(20ms);
+}
+
+// Send-buffer high-water mark (single Manager): a reader that cannot keep up
+// must be dropped once the server's unsent backlog exceeds the cap, instead of
+// the server buffering the whole response. The connection is closed mid-stream,
+// so the client reads far less than the full body before EOF.
+static void test_max_send_buffer()
+{
+    Manager mgr;
+    mgr.set_max_send_buffer(64 * 1024);  // 64 KB cap
+    // No idle/request timeout: only backpressure can close this connection.
+
+    const size_t body_size = 4 * 1024 * 1024;  // 4 MB, far over the cap
+    std::string big(body_size, 'x');
+    auto ref = mgr.http_listen("http://127.0.0.1:18896",
+        HandlerFn([&big](Connection& c, Event ev, void*) {
+            if (ev == Event::HttpMessage)
+                http_reply(&c, 200, "Content-Type: text/plain\r\n", "%s",
+                           big.c_str());
+        }));
+    assert(ref);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(18896);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+
+    const char* req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(send(fd, req, strlen(req), 0) > 0);
+
+    // Read in large chunks but far slower than the server would like; the 4 MB
+    // backlog stays well above the 64 KB cap, so the server drops us. We see EOF
+    // after reading only what was already in flight -- much less than the body.
+    size_t total = 0;
+    bool server_closed = false;
+    for (int i = 0; i < 200 && !server_closed; i++) {
+        mgr.poll(20ms);
+        char buf[64 * 1024];
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 0)
+            server_closed = true;     // server's FIN: connection was dropped
+        else if (n > 0)
+            total += static_cast<size_t>(n);
+        else
+            std::this_thread::sleep_for(10ms);
+    }
+    close(fd);
+
+    assert(server_closed);            // backpressure closed the slow reader
+    assert(total < body_size);        // the full body was never delivered
+    assert(mgr.num_connections() == 0);
+}
+
+// Global max-connection cap (ShardedManager): enforced at the single acceptor
+// across all workers. Excess connections are closed without handoff; a worker
+// closing a connection frees a slot.
+static void test_sharded_max_connections()
+{
+    const uint16_t port = 18897;
+    ShardedManager sharded(4);
+    sharded.set_max_connections(4);
+    assert(sharded.max_connections() == 4);
+
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [](Connection& c, HttpMessage&) {
+            http_reply(&c, 200, "", "ok");
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(100ms);
+
+    // Eight idle clients (send nothing) against a global cap of four.
+    std::vector<int> fds;
+    for (int i = 0; i < 8; i++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        struct sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+        if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0)
+            fds.push_back(fd);
+        else
+            close(fd);
+    }
+    std::this_thread::sleep_for(400ms);  // let the acceptor process every accept
+
+    assert(sharded.num_connections() == 4);  // global cap held
+
+    int eofs = 0, alive = 0;
+    for (int fd : fds) {
+        char buf[8];
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 0) eofs++;
+        else alive++;
+    }
+    assert(eofs == 4);   // four rejected without handoff
+    assert(alive == 4);  // four adopted
+
+    for (int fd : fds) close(fd);
+    sharded.stop();
+    runner.join();
+}
+
+// Graceful drain: a request in flight when drain() is called must still receive
+// its complete response, the acceptor must stop taking new connections, and
+// run() must return once every connection has finished and closed.
+static void test_sharded_graceful_drain()
+{
+    const uint16_t port = 18898;
+    ShardedManager sharded(2);
+
+    std::atomic<int> served{0};
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [&served](Connection& c, HttpMessage&) {
+            // Simulate work still in progress when drain() is called.
+            std::this_thread::sleep_for(300ms);
+            served.fetch_add(1, std::memory_order_relaxed);
+            http_reply(&c, 200, "Content-Type: text/plain\r\n", "ok");
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(100ms);
+
+    // Fire a request, then begin draining while the handler is mid-flight.
+    std::atomic<bool> got200{false};
+    std::thread client([&got200, port]() { got200.store(http_get_200(port)); });
+    std::this_thread::sleep_for(100ms);  // request is sent, handler is sleeping
+    sharded.drain(3000);                 // must let the in-flight request finish
+
+    client.join();
+    runner.join();  // run() returns on its own once fully drained
+
+    assert(got200.load());                   // in-flight request got its 200
+    assert(served.load() == 1);
+    assert(sharded.num_connections() == 0);  // everything drained and closed
+}
+
+// Drain deadline: a connection that cannot finish (a response that never flushes
+// because the client never reads) must not hang the drain. The deadline forces
+// run() to return.
+static void test_sharded_drain_deadline()
+{
+    const uint16_t port = 18899;
+    ShardedManager sharded(2);
+
+    std::string big(2 * 1024 * 1024, 'x');  // far larger than socket buffers
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [&big](Connection& c, HttpMessage&) {
+            http_reply(&c, 200, "Content-Type: text/plain\r\n", "%s",
+                       big.c_str());
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(100ms);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+    const char* req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(send(fd, req, strlen(req), 0) > 0);
+    std::this_thread::sleep_for(150ms);  // let the 8 MB response queue up unflushed
+
+    // The stuck connection cannot drain; the deadline must force run() to return.
+    uint64_t t0 = millis();
+    sharded.drain(300);
+    runner.join();
+    uint64_t elapsed = millis() - t0;
+    close(fd);
+
+    assert(elapsed >= 250);    // waited roughly the deadline
+    assert(elapsed < 10000);   // but returned -- did not hang on the stuck conn
+                               // (generous upper bound: sanitizer builds are slow)
+}
 #endif  // _WIN32
 
 int main()
@@ -649,8 +879,13 @@ int main()
     test_idle_timeout();
     test_request_timeout();
     test_max_body_size();
+    test_max_connections();
+    test_max_send_buffer();
     test_sharded_concurrent_requests();
     test_sharded_destructor_stops_run();
+    test_sharded_max_connections();
+    test_sharded_graceful_drain();
+    test_sharded_drain_deadline();
 #endif
 
     puts("All tests passed");

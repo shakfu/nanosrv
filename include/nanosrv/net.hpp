@@ -114,6 +114,17 @@ struct Mgr {
     // rejected with 413; an oversized Content-Length is rejected before the body
     // is buffered.
     size_t max_body_size;
+    // Maximum number of simultaneously accepted connections. 0 = disabled.
+    // When num_accepted is at the cap, a freshly accepted socket is closed
+    // immediately instead of being adopted (defends against accept-flooding).
+    int max_connections;
+    // Live count of currently accepted connections on this manager; incremented
+    // on accept, decremented on close. Used to enforce max_connections.
+    int num_accepted;
+    // Send-buffer high-water mark in bytes for accepted connections. 0 = disabled.
+    // A connection whose unsent outbound backlog (send.len) exceeds this is
+    // closed (defends against a slow/stalled reader tying up send buffering).
+    size_t max_send_buffer;
     bool use_dns6;
     unsigned long nextid;
     void* userdata;
@@ -310,6 +321,34 @@ public:
     void set_max_body_size(size_t bytes) { mgr_.max_body_size = bytes; }
     size_t max_body_size() const { return mgr_.max_body_size; }
 
+    // Maximum number of simultaneously accepted connections; 0 disables it
+    // (the default). When the cap is reached, newly accepted sockets are closed
+    // immediately rather than adopted into the event loop.
+    void set_max_connections(int n) { mgr_.max_connections = n; }
+    int max_connections() const { return mgr_.max_connections; }
+    // Current number of live accepted connections.
+    int num_connections() const { return mgr_.num_accepted; }
+
+    // Send-buffer high-water mark in bytes for accepted connections; 0 disables
+    // it (the default). A connection whose unsent outbound backlog exceeds this
+    // is closed on the next poll (drops a slow/stalled reader).
+    void set_max_send_buffer(size_t bytes) { mgr_.max_send_buffer = bytes; }
+    size_t max_send_buffer() const { return mgr_.max_send_buffer; }
+
+    // Begin a graceful shutdown: close every listener (stop accepting) and mark
+    // every accepted connection draining, so it finishes flushing its current
+    // response and then closes. After calling this, keep driving poll() until
+    // num_connections() reaches 0 (optionally with your own deadline), then stop.
+    // Idempotent; safe to call from a handler or between polls.
+    void start_drain() {
+        for (struct Connection* c = mgr_.conns; c != nullptr; c = c->next) {
+            if (c->is_listening)
+                c->is_closing = 1;            // stop accepting new connections
+            else if (c->is_accepted && !c->is_closing)
+                c->is_draining = 1;           // finish in-flight, then close
+        }
+    }
+
 private:
     struct Mgr mgr_;
 };
@@ -336,8 +375,16 @@ public:
     // Start worker threads + acceptor loop. Blocks until stop() is called.
     void run();
 
-    // Signal all workers to stop (call from signal handler or another thread).
+    // Signal all workers to stop immediately, abandoning in-flight requests
+    // (call from a signal handler or another thread).
     void stop();
+
+    // Begin a graceful shutdown: stop accepting new connections, let workers
+    // finish flushing in-flight responses, then return from run(). Any connection
+    // still open after timeout_ms is closed (0 = wait indefinitely). Safe to call
+    // from a signal handler or another thread; returns immediately -- run() carries
+    // out the drain and returns once it completes.
+    void drain(int timeout_ms = 5000);
 
     // Idle timeout (ms) for accepted connections, applied to every worker.
     // Set before run() so the value is visible to worker threads without a race.
@@ -358,9 +405,28 @@ public:
             w->set_max_body_size(bytes);
     }
 
+    // Global cap on simultaneously accepted connections across all workers,
+    // enforced at the acceptor thread. 0 disables it. Set before run().
+    void set_max_connections(int n) { max_connections_ = n; }
+    int max_connections() const { return max_connections_; }
+    // Current number of live connections handed off and not yet closed.
+    int num_connections() const {
+        return live_conns_.load(std::memory_order_relaxed);
+    }
+
+    // Send-buffer high-water mark (bytes), applied to every worker. Set before
+    // run(). A connection whose outbound backlog exceeds this is closed.
+    void set_max_send_buffer(size_t bytes) {
+        for (auto& w : workers_)
+            w->set_max_send_buffer(bytes);
+    }
+
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }
 
 private:
+    // Wake the acceptor and worker loops if their pipes are initialized.
+    void wake_all();
+
     std::vector<std::unique_ptr<Manager>> workers_;
     std::vector<std::thread> threads_;
     Manager acceptor_;
@@ -371,6 +437,24 @@ private:
     std::atomic<unsigned> next_{0};
     std::shared_ptr<std::vector<WorkerQueue>> queues_;
     std::shared_ptr<HttpHandler> handler_;
+    // Global accepted-connection cap, enforced at the single acceptor thread.
+    // max_connections_ is the limit (0 = disabled); live_conns_ is the count of
+    // connections handed off and not yet closed by a worker. The acceptor reads
+    // and increments; workers decrement on close. Single producer (the acceptor)
+    // so the check-then-increment cannot over-admit.
+    int max_connections_{0};
+    std::atomic<int> live_conns_{0};
+    // Graceful-drain state, consumed by run()'s loops. draining_ flips the
+    // acceptor to reject new connections and the workers to mark their
+    // connections draining; drain_deadline_ (millis, 0 = none) bounds the wait.
+    std::atomic<bool> draining_{false};
+    std::atomic<uint64_t> drain_deadline_{0};
+    // Set (release) by run() once every wakeup pipe is initialized, cleared after
+    // the loops exit. stop()/drain() read it (acquire) before touching a worker's
+    // pipe via wake_mgr(), so the pipe write in wakeup_init() happens-before any
+    // cross-thread wake. While false, the wake is skipped -- the loops still react
+    // on their next fallback poll.
+    std::atomic<bool> pipes_ready_{false};
 };
 
 } // namespace nanosrv

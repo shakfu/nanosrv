@@ -190,6 +190,9 @@ struct Connection* alloc_conn(struct Mgr* mgr)
 void close_conn(struct Connection* c)
 {
     resolve_cancel(c); // Close any pending DNS query
+    // Maintain the live accepted-connection count for the max_connections cap.
+    if (c->is_accepted && c->mgr->num_accepted > 0)
+        c->mgr->num_accepted--;
     LIST_DELETE(struct Connection, &c->mgr->conns, c);
     if (c == c->mgr->dns4.c)
         c->mgr->dns4.c = NULL;

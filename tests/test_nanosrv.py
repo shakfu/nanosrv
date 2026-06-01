@@ -533,6 +533,175 @@ class TestCallbackObjectLifetime:
             stop.set()
             t.join(timeout=2)
 
+    def test_max_connections_caps_accepts(self):
+        # Once the live accepted-connection count hits the cap, further accepts
+        # are closed immediately. Three idle clients against a cap of two: the
+        # count holds at two and exactly one client is dropped (EOF).
+        import socket
+
+        mgr = nanosrv.Manager()
+        mgr.set_max_connections(2)
+        assert mgr.max_connections == 2
+        mgr.http_listen("http://127.0.0.1:18364",
+                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(20)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        socks = []
+        try:
+            time.sleep(0.05)
+            for _ in range(3):
+                s = socket.create_connection(("127.0.0.1", 18364), timeout=2)
+                s.setblocking(False)
+                socks.append(s)
+            time.sleep(0.5)  # let the acceptor process all three
+
+            assert mgr.num_connections == 2  # cap held
+
+            eofs = 0
+            for s in socks:
+                try:
+                    if s.recv(16) == b"":
+                        eofs += 1  # server closed this one (rejected)
+                except BlockingIOError:
+                    pass             # still open, no data pending
+            assert eofs == 1, f"expected one rejected conn, got {eofs}"
+        finally:
+            for s in socks:
+                s.close()
+            stop.set()
+            t.join(timeout=2)
+
+    def test_max_send_buffer_drops_slow_reader(self):
+        # A reader that does not drain its socket must be dropped once the
+        # server's unsent backlog exceeds the cap. The connection closes
+        # mid-stream, so the client reads far less than the full body.
+        import socket
+
+        mgr = nanosrv.Manager()
+        mgr.set_max_send_buffer(64 * 1024)  # 64 KB
+        assert mgr.max_send_buffer == 64 * 1024
+
+        body_size = 4 * 1024 * 1024  # 4 MB, far over the cap
+        body = "x" * body_size
+        mgr.http_listen(
+            "http://127.0.0.1:18365",
+            lambda conn, msg: conn.http_reply(
+                200, "Content-Type: text/plain\r\n", body),
+        )
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(20)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.05)
+            s = socket.create_connection(("127.0.0.1", 18365), timeout=3)
+            s.settimeout(5.0)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+
+            # Read until EOF. The server drops us mid-response, so the total is
+            # far below the 4 MB body.
+            total = 0
+            while True:
+                chunk = s.recv(64 * 1024)
+                if chunk == b"":
+                    break
+                total += len(chunk)
+            s.close()
+            assert total < body_size, (
+                f"expected truncated response, read {total} of {body_size}")
+            assert mgr.num_connections == 0
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
+    def test_start_drain_single_threaded(self):
+        # Manager.start_drain() closes listeners (stops accepting) and drains
+        # accepted connections. Driven on the poll thread, so it is race-free.
+        import socket
+
+        mgr = nanosrv.Manager()
+        mgr.http_listen("http://127.0.0.1:18367",
+                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+
+        # Open an idle keep-alive connection and let it be accepted.
+        s = socket.create_connection(("127.0.0.1", 18367), timeout=2)
+        for _ in range(10):
+            mgr.poll(20)
+        assert mgr.num_connections == 1
+
+        # Begin draining on this same thread, then poll until it has drained.
+        mgr.start_drain()
+        for _ in range(50):
+            mgr.poll(20)
+            if mgr.num_connections == 0:
+                break
+        assert mgr.num_connections == 0  # idle connection closed by the drain
+        s.close()
+
+        # The listener is closed, so new connections are refused.
+        for _ in range(5):
+            mgr.poll(20)
+        refused = False
+        try:
+            s2 = socket.create_connection(("127.0.0.1", 18367), timeout=1)
+            s2.close()
+        except OSError:
+            refused = True
+        assert refused, "expected listener closed after drain"
+
+    def test_sharded_drain_finishes_inflight(self):
+        # ShardedManager.drain() (thread-safe) must let an in-flight request
+        # finish, then make run() return on its own.
+        import socket
+
+        mgr = nanosrv.ShardedManager(2)
+        served = {"n": 0}
+
+        def handler(conn, msg):
+            time.sleep(0.3)  # still in flight when drain() is called
+            served["n"] += 1
+            conn.http_reply(200, "Content-Type: text/plain\r\n", "ok")
+
+        mgr.http_listen("http://127.0.0.1:18368", handler)
+        runner = threading.Thread(target=mgr.run, daemon=True)
+        runner.start()
+        time.sleep(0.1)
+
+        result = {}
+
+        def client():
+            try:
+                r = urllib.request.urlopen("http://127.0.0.1:18368/", timeout=5)
+                result["code"] = r.getcode()
+                result["body"] = r.read()
+            except Exception as e:  # noqa: BLE001
+                result["err"] = e
+
+        ct = threading.Thread(target=client)
+        ct.start()
+        time.sleep(0.1)     # request is sent, handler is sleeping
+        mgr.drain(3000)     # graceful: let the in-flight request complete
+
+        ct.join()
+        runner.join(timeout=5)
+        assert not runner.is_alive(), "run() did not return after drain"
+        assert result.get("code") == 200, f"got {result}"
+        assert result.get("body") == b"ok"
+        assert served["n"] == 1
+        assert mgr.num_connections == 0
+
     def test_callback_is_released_when_listener_closes(self):
         # H1 regression: the listener must hold the callback while open and
         # release it when the Manager is destroyed. The previous binding leaked

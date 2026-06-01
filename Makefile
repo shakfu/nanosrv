@@ -118,6 +118,11 @@ server-clean:
 bench: server-build build
 	bash scripts/bench.sh
 
+# Strict A/B benchmark: working tree vs a baseline git ref (default HEAD).
+# Pass extra flags via ARGS, e.g. `make ab-bench ARGS="--ref v0.1.0 --reps 5"`.
+ab-bench:
+	uv run python scripts/ab_bench.py $(ARGS)
+
 # ---------------------------------------------------------------------------
 # Clean
 # ---------------------------------------------------------------------------
@@ -170,6 +175,7 @@ help:
 	@echo ""
 	@echo "Other targets:"
 	@echo "  bench          - Run wrk benchmarks (builds everything first)"
+	@echo "  ab-bench       - A/B benchmark vs a baseline ref (ARGS=\"--ref ...\")"
 	@echo "  clean          - Remove Python build artifacts"
 	@echo "  distclean      - Remove all generated files"
 	@echo "  help           - Show this help message"

@@ -566,6 +566,13 @@ static void accept_conn(struct Mgr* mgr, struct Connection* lsn)
         MG_ERROR(("%ld > %ld", (long)fd, (long)FD_SETSIZE));
         closesocket(fd);
 #endif
+    } else if (mgr->max_connections > 0
+               && mgr->num_accepted >= mgr->max_connections) {
+        // Connection cap reached: close the freshly accepted socket immediately
+        // instead of adopting it, so the listener does not busy-loop readable.
+        MG_ERROR(("%lu connection cap %d reached, rejecting", lsn->id,
+                  mgr->max_connections));
+        closesocket(fd);
     } else if ((c = alloc_conn(mgr)) == NULL) {
         MG_ERROR(("%lu OOM", lsn->id));
         closesocket(fd);
@@ -578,6 +585,7 @@ static void accept_conn(struct Mgr* mgr, struct Connection* lsn)
         set_non_blocking_mode(FD(c));
         setsockopts(c);
         c->is_accepted = 1;
+        mgr->num_accepted++;  // live count for the max_connections cap
         c->is_hexdumping = lsn->is_hexdumping;
         setlocaddr(fd,
                    &c->loc); // set local addr to where the client connected to
@@ -1031,6 +1039,18 @@ void mgr_poll(struct Mgr* mgr, int ms)
             } else if (now > c->recv_deadline) {
                 c->is_closing = 1;
             }
+        }
+        // Send-buffer high-water mark: drop an accepted connection whose unsent
+        // outbound backlog has grown past the cap. This is the slow-reader
+        // defense -- a peer that stops draining its socket would otherwise tie
+        // up unbounded send buffering. Closing discards the queued bytes, which
+        // is the intended policy (the reader is already not consuming them).
+        if (mgr->max_send_buffer > 0 && c->is_accepted && !c->is_closing
+            && c->send.len > mgr->max_send_buffer) {
+            MG_ERROR(("%lu send backlog %lu exceeds cap %lu, closing", c->id,
+                      (unsigned long)c->send.len,
+                      (unsigned long)mgr->max_send_buffer));
+            c->is_closing = 1;
         }
         if (c->is_closing)
             sock_close(c);

@@ -406,7 +406,26 @@ NB_MODULE(_core, m) {
              "Reject request bodies larger than `bytes` with HTTP 413. An "
              "oversized Content-Length is rejected before the body is buffered. "
              "0 disables (the default).")
-        .def_prop_ro("max_body_size", &nanosrv::Manager::max_body_size);
+        .def_prop_ro("max_body_size", &nanosrv::Manager::max_body_size)
+        .def("set_max_connections", &nanosrv::Manager::set_max_connections,
+             "n"_a,
+             "Cap the number of simultaneously accepted connections at `n`. "
+             "When the cap is reached, newly accepted sockets are closed "
+             "immediately instead of adopted. 0 disables (the default).")
+        .def_prop_ro("max_connections", &nanosrv::Manager::max_connections)
+        .def_prop_ro("num_connections", &nanosrv::Manager::num_connections,
+             "Current number of live accepted connections.")
+        .def("set_max_send_buffer", &nanosrv::Manager::set_max_send_buffer,
+             "bytes"_a,
+             "Close an accepted connection whose unsent outbound backlog "
+             "exceeds `bytes` (drops a slow/stalled reader). 0 disables (the "
+             "default).")
+        .def_prop_ro("max_send_buffer", &nanosrv::Manager::max_send_buffer)
+        .def("start_drain", &nanosrv::Manager::start_drain,
+             "Begin a graceful shutdown: close every listener (stop accepting) "
+             "and mark each accepted connection draining so it finishes its "
+             "current response and then closes. Keep calling poll() until "
+             "num_connections reaches 0, then stop.");
 
     // -----------------------------------------------------------------------
     // ShardedManager (multi-threaded event loop)
@@ -438,7 +457,13 @@ NB_MODULE(_core, m) {
             mgr.run();
         }, "Start worker threads and acceptor loop. Blocks until stop().")
         .def("stop", &nanosrv::ShardedManager::stop,
-             "Signal all workers to stop.")
+             "Signal all workers to stop immediately, abandoning in-flight "
+             "requests.")
+        .def("drain", &nanosrv::ShardedManager::drain, "timeout_ms"_a = 5000,
+             "Begin a graceful shutdown: stop accepting, let workers finish "
+             "in-flight responses, then return from run(). Connections still "
+             "open after timeout_ms are closed (0 = wait indefinitely). Returns "
+             "immediately; call from another thread while run() is executing.")
         .def("set_idle_timeout", &nanosrv::ShardedManager::set_idle_timeout,
              "ms"_a,
              "Close accepted connections idle for `ms` ms on every worker. "
@@ -451,6 +476,21 @@ NB_MODULE(_core, m) {
              &nanosrv::ShardedManager::set_max_body_size, "bytes"_a,
              "Maximum request body size (bytes) on every worker; larger bodies "
              "get HTTP 413. Set before run(). 0 disables (the default).")
+        .def("set_max_connections",
+             &nanosrv::ShardedManager::set_max_connections, "n"_a,
+             "Global cap on simultaneously accepted connections across all "
+             "workers, enforced at the acceptor. Set before run(). 0 disables "
+             "(the default).")
+        .def_prop_ro("max_connections",
+             &nanosrv::ShardedManager::max_connections)
+        .def_prop_ro("num_connections",
+             &nanosrv::ShardedManager::num_connections,
+             "Current number of live connections across all workers.")
+        .def("set_max_send_buffer",
+             &nanosrv::ShardedManager::set_max_send_buffer, "bytes"_a,
+             "Send-buffer high-water mark (bytes) on every worker; a connection "
+             "whose outbound backlog exceeds it is closed. Set before run(). "
+             "0 disables (the default).")
         .def_prop_ro("num_workers", &nanosrv::ShardedManager::num_workers);
 
     // -----------------------------------------------------------------------

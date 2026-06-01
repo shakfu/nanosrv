@@ -12,6 +12,9 @@ This avoids the macOS `SO_REUSEPORT` limitation (which does not load-balance acr
 
 ```bash
 nanosrv-sharded [--port <1-65535>] [--threads <N>] [--busy <microseconds>]
+                [--idle-timeout <ms>] [--request-timeout <ms>] [--max-body <bytes>]
+                [--max-connections <N>] [--max-send-buffer <bytes>]
+                [--drain-timeout <ms>]
 ```
 
 **Options:**
@@ -21,6 +24,12 @@ nanosrv-sharded [--port <1-65535>] [--threads <N>] [--busy <microseconds>]
 | `--port` | 8000 | Listen port |
 | `--threads` | 0 (all cores) | Number of worker threads |
 | `--busy` | 0 | Microseconds of CPU spin per request (benchmarking) |
+| `--idle-timeout` | 0 (disabled) | Close idle connections after N ms (applied to every worker) |
+| `--request-timeout` | 0 (disabled) | Close connections that buffer an incomplete request past N ms (every worker) |
+| `--max-body` | 0 (disabled) | Reject request bodies larger than N bytes with HTTP 413 (every worker) |
+| `--max-connections` | 0 (disabled) | Global cap on simultaneously accepted connections, enforced at the acceptor; excess are closed |
+| `--max-send-buffer` | 0 (disabled) | Close a connection whose unsent outbound backlog exceeds N bytes (every worker) |
+| `--drain-timeout` | 5000 | On SIGINT/SIGTERM, stop accepting and finish in-flight requests for up to N ms before forcing close (0 = stop immediately) |
 
 ## Building
 

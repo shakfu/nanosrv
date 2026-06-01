@@ -32,6 +32,12 @@ int main(int argc, char** argv)
     int port = 8000;
     unsigned threads = 0;
     int busy = 0;
+    int idle_timeout = 0;
+    int request_timeout = 0;
+    size_t max_body = 0;
+    int max_conns = 0;
+    size_t max_send = 0;
+    int drain_timeout = 5000;
 
     app.add_option("-p,--port", port, "Listen port")
         ->default_val(8000)
@@ -40,6 +46,30 @@ int main(int argc, char** argv)
         ->default_val(0);
     app.add_option("-b,--busy", busy, "Microseconds of CPU spin per request")
         ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--idle-timeout", idle_timeout,
+                   "Close idle connections after N ms (0 = disabled)")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--request-timeout", request_timeout,
+                   "Close connections that buffer an incomplete request past N ms (0 = disabled)")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--max-body", max_body,
+                   "Reject request bodies larger than N bytes with HTTP 413 (0 = disabled)")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--max-connections", max_conns,
+                   "Global cap on simultaneously accepted connections; excess are closed (0 = disabled)")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--max-send-buffer", max_send,
+                   "Close a connection whose unsent outbound backlog exceeds N bytes (0 = disabled)")
+        ->default_val(0)
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--drain-timeout", drain_timeout,
+                   "On shutdown, finish in-flight requests for up to N ms before forcing close (0 = stop immediately)")
+        ->default_val(5000)
         ->check(CLI::NonNegativeNumber);
 
     std::atexit([]() { std::cout << rang::style::reset; });
@@ -62,6 +92,13 @@ int main(int argc, char** argv)
     log_level = MG_LL_ERROR;
 
     ShardedManager mgr(threads);
+
+    if (idle_timeout > 0) mgr.set_idle_timeout(idle_timeout);
+    if (request_timeout > 0) mgr.set_request_timeout(request_timeout);
+    if (max_body > 0) mgr.set_max_body_size(max_body);
+    if (max_conns > 0) mgr.set_max_connections(max_conns);
+    if (max_send > 0) mgr.set_max_send_buffer(max_send);
+
     mgr.http_listen(url,
         [](Connection& c, HttpMessage& hm) {
             busy_spin(s_busy_us);
@@ -78,8 +115,14 @@ int main(int argc, char** argv)
         std::this_thread::sleep_for(100ms);
     }
 
-    printf("\nShutting down...\n");
-    mgr.stop();
+    if (drain_timeout > 0) {
+        printf("\nDraining (up to %d ms for in-flight requests)...\n",
+               drain_timeout);
+        mgr.drain(drain_timeout);  // finish in-flight, stop accepting, then exit
+    } else {
+        printf("\nShutting down...\n");
+        mgr.stop();                // abrupt: abandon in-flight requests
+    }
     runner.join();
     return 0;
 }
