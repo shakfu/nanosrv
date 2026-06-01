@@ -229,7 +229,7 @@ This produces terminal output and an HTML report at `build/bench-report.html` wi
 
 **Decision flowchart:**
 
-```
+```text
 Is it a Python project?
   yes --> Is the handler pure Python?
             yes --> nanosrv Python Manager
@@ -249,7 +249,7 @@ Is it a Python project?
 
 Use `make help` for the full list. Key targets:
 
-```
+```text
 make build       # rebuild extension after code changes
 make test        # run pytest suite
 make lint        # ruff check + fix
@@ -263,7 +263,7 @@ make clean       # remove build artifacts
 
 C++ server targets:
 
-```
+```text
 make server-build   # build nanosrv-server and nanosrv-sharded via CMake
 make server-run     # build and run nanosrv-server
 make server-test    # build and run C++ tests via ctest
