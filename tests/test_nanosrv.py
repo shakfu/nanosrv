@@ -177,6 +177,38 @@ class TestMillis:
         assert t2 >= t1
 
 
+class TestTls:
+    def test_tls_unavailable_in_default_build(self):
+        # The default build links the no-op TLS stub.
+        assert nanosrv.tls_available() is False
+
+    def test_https_listen_raises(self):
+        # A TLS URL must raise up front (clear error) rather than failing later
+        # at the stub handshake.
+        mgr = nanosrv.Manager()
+        for url in ("https://127.0.0.1:18370", "wss://127.0.0.1:18370"):
+            with pytest.raises(RuntimeError, match="TLS is not available"):
+                mgr.http_listen(url, lambda conn, msg: None)
+            with pytest.raises(RuntimeError, match="TLS is not available"):
+                mgr.http_listen_event(url, lambda conn, ev, data: None)
+
+    def test_sharded_https_listen_raises(self):
+        mgr = nanosrv.ShardedManager(2)
+        with pytest.raises(RuntimeError, match="TLS is not available"):
+            mgr.http_listen("https://127.0.0.1:18371", lambda conn, msg: None)
+
+    def test_plain_url_still_listens(self):
+        # Non-TLS schemes are unaffected by the guard.
+        mgr = nanosrv.Manager()
+        ref = mgr.http_listen("http://127.0.0.1:18372", lambda conn, msg: None)
+        assert ref is not None
+
+    def test_url_parse_does_not_raise(self):
+        # Parsing a TLS URL is fine; only listening on one is rejected.
+        u = nanosrv.Url.parse("https://example.com:443/x")
+        assert u.is_ssl is True
+
+
 # ---------------------------------------------------------------------------
 # Manager tests
 # ---------------------------------------------------------------------------

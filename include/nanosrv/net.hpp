@@ -199,6 +199,12 @@ void mgr_free(struct Mgr*);
 size_t conn_printf(struct Connection*, const char* fmt, ...);
 size_t conn_vprintf(struct Connection*, const char* fmt, va_list* ap);
 bool aton(struct Str str, struct Address* addr);
+
+// Evaluate an IP against an ACL string of comma-separated "+net/prefix" /
+// "-net/prefix" entries (IPv4 and IPv6). Returns 1 = allowed, 0 = denied,
+// negative = malformed ACL. NOTE: this is a building block; ACLs are not yet
+// wired into the accept path (no listener enforces one automatically).
+int check_ip_acl(struct Str acl, struct Address* remote_ip);
 bool wakeup(struct Mgr*, unsigned long id, const void* buf, size_t len);
 
 [[nodiscard]] struct Connection* alloc_conn(struct Mgr*);

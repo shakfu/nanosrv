@@ -5,6 +5,8 @@ namespace nanosrv {
 // ---- module: tls_dummy ----
 // TLS stubs (all no-ops) -- included unconditionally since nanosrv has no TLS
 
+bool tls_available() { return false; }
+
 void tls_init(struct Connection* c, const struct TlsOpts* opts)
 {
     (void)opts;

@@ -117,42 +117,77 @@ uint32_t crc32_(uint32_t crc, const char* buf, size_t len)
     return ~crc;
 }
 
-static int isbyte(int n) { return n >= 0 && n <= 255; }
-
-static int parse_net(const char* spec, uint32_t* net, uint32_t* mask)
+// Compare the leading `bits` bits of two network-order address byte arrays.
+static bool ip_prefix_eq(const uint8_t* a, const uint8_t* b, int bits)
 {
-    int n, a, b, c, d, slash = 32, len = 0;
-    if ((sscanf(spec, "%d.%d.%d.%d/%d%n", &a, &b, &c, &d, &slash, &n) == 5
-         || sscanf(spec, "%d.%d.%d.%d%n", &a, &b, &c, &d, &n) == 4)
-        && isbyte(a) && isbyte(b) && isbyte(c) && isbyte(d) && slash >= 0
-        && slash < 33) {
-        len = n;
-        *net = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8)
-            | (uint32_t)d;
-        *mask = slash ? (uint32_t)(0xffffffffU << (32 - slash)) : (uint32_t)0;
+    int whole = bits / 8;
+    int rem = bits % 8;
+    for (int i = 0; i < whole; i++)
+        if (a[i] != b[i])
+            return false;
+    if (rem != 0) {
+        uint8_t mask = static_cast<uint8_t>(0xffU << (8 - rem));
+        if ((a[whole] & mask) != (b[whole] & mask))
+            return false;
     }
-    return len;
+    return true;
 }
 
+// Evaluate an IP against an ACL of comma-separated entries, each "+<net>" or
+// "-<net>" where <net> is an IPv4 or IPv6 address with an optional "/<prefix>"
+// (a bare address is a host route -- /32 for IPv4, /128 for IPv6). The last
+// matching entry wins; with a non-empty ACL the default is deny. An entry only
+// applies to peers of its own address family (IPv4 entries never match IPv6
+// peers and vice versa). Both families are matched the same way -- a bitwise
+// prefix compare over the network-order address bytes -- so a restrictive ACL
+// no longer fails open for IPv6 (previously the IPv6 path returned early).
+//
+// Returns 1 = allowed, 0 = denied, -1 = malformed entry (missing/bad +/- flag),
+// -2 = unparseable address or prefix.
 int check_ip_acl(struct Str acl, struct Address* remote_ip)
 {
     struct Str entry;
-    int allowed = acl.len == 0 ? '+'
-                               : '-'; // If any ACL is set, deny by default
-    uint32_t remote_ip4;
-    if (remote_ip->is_ip6) {
-        return -1; // TODO(): handle IPv6 ACL and addresses
-    } else {       // IPv4
-        memcpy((void*)&remote_ip4, remote_ip->addr.ip, sizeof(remote_ip4));
-        while (span(acl, &entry, &acl, ',')) {
-            uint32_t net, mask;
-            if (entry.buf[0] != '+' && entry.buf[0] != '-')
-                return -1;
-            if (parse_net(&entry.buf[1], &net, &mask) == 0)
-                return -2;
-            if ((ntohl_(remote_ip4) & mask) == net)
-                allowed = entry.buf[0];
+    int allowed = acl.len == 0 ? '+' : '-'; // non-empty ACL: deny by default
+    while (span(acl, &entry, &acl, ',')) {
+        if (entry.len < 2 || (entry.buf[0] != '+' && entry.buf[0] != '-'))
+            return -1;
+        char flag = entry.buf[0];
+
+        // Split "<addr>[/<prefix>]" (everything after the +/- flag).
+        struct Str spec = str_n(&entry.buf[1], entry.len - 1);
+        struct Str addr_str = spec;
+        long prefix = -1;
+        for (size_t i = 0; i < spec.len; i++) {
+            if (spec.buf[i] == '/') {
+                addr_str = str_n(spec.buf, i);
+                unsigned long p = 0;
+                if (!str_to_num(str_n(&spec.buf[i + 1], spec.len - i - 1), 10,
+                                &p, sizeof(p)))
+                    return -2;
+                prefix = static_cast<long>(p);
+                break;
+            }
         }
+        if (addr_str.len == 0)
+            return -2;
+
+        struct Address net;
+        memset(&net, 0, sizeof(net));
+        if (!aton(addr_str, &net))
+            return -2;
+
+        int maxbits = net.is_ip6 ? 128 : 32;
+        if (prefix < 0)
+            prefix = maxbits; // bare address: exact host match
+        if (prefix > maxbits)
+            return -2;
+
+        // An entry only applies to peers of the same address family.
+        if (net.is_ip6 != remote_ip->is_ip6)
+            continue;
+        if (ip_prefix_eq(remote_ip->addr.ip, net.addr.ip,
+                         static_cast<int>(prefix)))
+            allowed = flag;
     }
     return allowed == '+';
 }

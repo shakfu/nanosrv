@@ -340,6 +340,349 @@ static void test_str_constructors()
     assert(s4.len == 0 && s4.buf != nullptr);
 }
 
+// ---- IP ACL matching (IPv4 + IPv6) ----
+
+static void test_check_ip_acl()
+{
+    auto A = [](const char* s) {
+        Address a;
+        memset(&a, 0, sizeof(a));
+        assert(aton(Str(s), &a));
+        return a;
+    };
+
+    Address v4 = A("10.0.0.5");
+    Address v4b = A("192.168.1.1");
+
+    // Empty ACL allows everyone; a non-empty ACL defaults to deny.
+    assert(check_ip_acl(Str(""), &v4) == 1);
+    assert(check_ip_acl(Str("+10.0.0.0/8"), &v4) == 1);
+    assert(check_ip_acl(Str("+192.168.0.0/16"), &v4) == 0);
+
+    // Last matching entry wins; bare address is a host route.
+    assert(check_ip_acl(Str("-10.0.0.0/8,+10.0.0.5"), &v4) == 1);
+    assert(check_ip_acl(Str("+10.0.0.0/8,-10.0.0.5"), &v4) == 0);
+    assert(check_ip_acl(Str("+10.0.0.5"), &v4) == 1);
+    assert(check_ip_acl(Str("+10.0.0.6"), &v4) == 0);
+
+    // IPv6 -- the regression fix. The old code returned early for any IPv6 peer,
+    // so a restrictive ACL silently failed open. It must now actually match.
+    Address v6 = A("2001:db8::1");
+    Address v6other = A("2001:dead::1");
+    assert(check_ip_acl(Str("+2001:db8::/32"), &v6) == 1);
+    assert(check_ip_acl(Str("+2001:db8::/32"), &v6other) == 0);
+    assert(check_ip_acl(Str("-2001:db8::/32"), &v6) == 0);
+    assert(check_ip_acl(Str("+2001:db8::1"), &v6) == 1);
+    assert(check_ip_acl(Str("+::/0"), &v6) == 1);  // allow all IPv6
+
+    // Cross-family: an entry only applies to its own family, so a single-family
+    // allow ACL DENIES the other family (it must not fail open).
+    assert(check_ip_acl(Str("+10.0.0.0/8"), &v6) == 0);
+    assert(check_ip_acl(Str("+2001:db8::/32"), &v4) == 0);
+
+    // Mixed ACL: each family honored independently.
+    Str mixed("+10.0.0.0/8,+2001:db8::/32");
+    assert(check_ip_acl(mixed, &v4) == 1);
+    assert(check_ip_acl(mixed, &v6) == 1);
+    assert(check_ip_acl(mixed, &v4b) == 0);
+    assert(check_ip_acl(mixed, &v6other) == 0);
+
+    // Malformed ACLs report an error (< 0), never a silent allow.
+    assert(check_ip_acl(Str("10.0.0.0/8"), &v4) < 0);     // missing +/- flag
+    assert(check_ip_acl(Str("+999.0.0.0/8"), &v4) < 0);   // bad address
+    assert(check_ip_acl(Str("+10.0.0.0/40"), &v4) < 0);   // IPv4 prefix > 32
+    assert(check_ip_acl(Str("+2001:db8::/200"), &v6) < 0); // IPv6 prefix > 128
+}
+
+// ---- TLS listener fails closed ----
+
+#if MG_TLS == MG_TLS_NONE
+// With no TLS backend, a TLS listener must be refused rather than created --
+// otherwise it would accept connections and serve cleartext (accepted conns
+// have is_tls reset to 0) on a port intended for TLS.
+static void test_listen_tls_unavailable_fails_closed()
+{
+    assert(!tls_available());
+    Manager mgr;
+
+    auto tls_ref = mgr.http_listen("https://127.0.0.1:18903",
+        HandlerFn([](Connection&, Event, void*) {}));
+    assert(!tls_ref);  // refused: no listener created
+
+    auto wss_ref = mgr.http_listen("wss://127.0.0.1:18903",
+        HandlerFn([](Connection&, Event, void*) {}));
+    assert(!wss_ref);  // wss too
+
+    // A plaintext listener on the same port still works.
+    auto ok = mgr.http_listen("http://127.0.0.1:18903",
+        HandlerFn([](Connection&, Event, void*) {}));
+    assert(ok);
+}
+#else
+// With a TLS backend compiled in, the fail-closed guard must NOT trigger: a TLS
+// listener is created normally. (The handshake path needs real certs and is
+// exercised separately.)
+static void test_listen_tls_unavailable_fails_closed()
+{
+    assert(tls_available());
+    Manager mgr;
+
+    auto tls_ref = mgr.http_listen("https://127.0.0.1:18903",
+        HandlerFn([](Connection&, Event, void*) {}));
+    assert(tls_ref);  // accepted: backend is available
+
+    auto wss_ref = mgr.http_listen("wss://127.0.0.1:18904",
+        HandlerFn([](Connection&, Event, void*) {}));
+    assert(wss_ref);
+}
+#endif
+
+// ---- TLS handshake, end to end ----
+
+#if MG_TLS != MG_TLS_NONE
+// Drive a real TLS handshake between a nanosrv server and a nanosrv client over
+// loopback, then exchange application bytes across the encrypted channel. This
+// is the proof that the compiled-in backend (tls_init/handshake/recv/send) works
+// together with the event loop's rtls buffering -- not just that listeners are
+// created. Client verification is enabled (the self-signed cert is its own CA,
+// matched against hostname "localhost") so the certificate path is exercised too.
+
+// Self-signed P-256 cert (CN=localhost, SAN DNS:localhost + IP:127.0.0.1),
+// valid for 100 years, generated with openssl. Key is unencrypted PKCS#8.
+static const char* kTlsCert = R"PEM(-----BEGIN CERTIFICATE-----
+MIIBmzCCAUGgAwIBAgIUFrt3rSagxHhy/YmYO3eNvzc52/4wCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDYwMjAyNDAzMVoYDzIxMjYwNTA5
+MDI0MDMxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQFCCg0+XCbw14kqC1c/j1ISLD22+nzyzwhRPTbtDxzKnn0MtnYHOU9
+xETYuU3Ik8lok4DNOmyqkVKoo4gk3C6To28wbTAdBgNVHQ4EFgQUVVT2w1oXbY7F
+rcvh2O0DZV8q7QAwHwYDVR0jBBgwFoAUVVT2w1oXbY7Frcvh2O0DZV8q7QAwDwYD
+VR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZI
+zj0EAwIDSAAwRQIgAfQMCH4aabNptOO8r8lCo+YcqW61UPGbUOcox8x2ZwECIQCn
+KWKm4TvhsRCX59ePfCiWqP95nuA9vajBrY0mXO5SmQ==
+-----END CERTIFICATE-----
+)PEM";
+
+static const char* kTlsKey = R"PEM(-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtFklKvZdVm4ojOkn
+x5+up0Im77q8xNPrVY563MBkMlahRANCAAQFCCg0+XCbw14kqC1c/j1ISLD22+nz
+yzwhRPTbtDxzKnn0MtnYHOU9xETYuU3Ik8lok4DNOmyqkVKoo4gk3C6T
+-----END PRIVATE KEY-----
+)PEM";
+
+struct TlsHandshakeState {
+    bool server_hs = false;
+    bool client_hs = false;
+    bool server_err = false;
+    bool client_err = false;
+    std::string server_got;  // plaintext the server decrypted
+    std::string client_got;  // plaintext the client decrypted (the echo)
+};
+
+static void drain_recv(Connection* c, std::string& into)
+{
+    into.append(reinterpret_cast<const char*>(c->recv.buf), c->recv.len);
+    iobuf_del(&c->recv, 0, c->recv.len);
+}
+
+static void tls_handshake_server_ev(Connection* c, int ev, void*)
+{
+    auto* st = static_cast<TlsHandshakeState*>(c->fn_data);
+    if (ev == MG_EV_ACCEPT) {
+        TlsOpts opts{};
+        opts.cert = Str(kTlsCert);
+        opts.key = Str(kTlsKey);
+        tls_init(c, &opts);
+    } else if (ev == MG_EV_TLS_HS) {
+        st->server_hs = true;
+    } else if (ev == MG_EV_READ) {
+        drain_recv(c, st->server_got);
+        send_data(c, st->server_got.data(), st->server_got.size());  // echo
+    } else if (ev == MG_EV_ERROR) {
+        st->server_err = true;
+    }
+}
+
+static void tls_handshake_client_ev(Connection* c, int ev, void*)
+{
+    auto* st = static_cast<TlsHandshakeState*>(c->fn_data);
+    if (ev == MG_EV_CONNECT) {
+        TlsOpts opts{};
+        opts.ca = Str(kTlsCert);     // self-signed cert is its own trust anchor
+        opts.name = Str("localhost");  // verified against the cert SAN
+        tls_init(c, &opts);
+    } else if (ev == MG_EV_TLS_HS) {
+        st->client_hs = true;
+        send_data(c, "ping", 4);     // first app bytes over the encrypted link
+    } else if (ev == MG_EV_READ) {
+        drain_recv(c, st->client_got);
+    } else if (ev == MG_EV_ERROR) {
+        st->client_err = true;
+    }
+}
+
+static void test_tls_handshake_end_to_end()
+{
+    assert(tls_available());
+    Manager mgr;
+    TlsHandshakeState st;
+    const char* url = "https://127.0.0.1:18905";
+
+    auto* lsn = listen_(mgr.raw(), url, tls_handshake_server_ev, &st);
+    assert(lsn != nullptr);
+    auto* cl = connect(mgr.raw(), url, tls_handshake_client_ev, &st);
+    assert(cl != nullptr);
+
+    // Pump the loop until the echo round-trips, bounded by a wall-clock deadline
+    // so a handshake failure surfaces as a failed assert rather than a hang.
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        mgr.poll(10ms);
+        if (st.client_err || st.server_err)
+            break;
+        if (st.client_got.size() >= 4)
+            break;
+    }
+
+    assert(!st.server_err);
+    assert(!st.client_err);
+    assert(st.server_hs);            // server completed the handshake
+    assert(st.client_hs);            // client completed the handshake (verified)
+    assert(st.server_got == "ping"); // plaintext arrived intact server-side
+    assert(st.client_got == "ping"); // and the echo decrypted intact client-side
+}
+
+// ---- Mutual TLS (client certificate) ----
+
+// A second self-signed P-256 identity (CN=test-client), used as the client's
+// certificate. Like the server cert it is CA:TRUE, so each side can trust the
+// other's cert directly as a one-element chain.
+static const char* kClientCert = R"PEM(-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgIUCL73yTbfhGsrEzPVhk6R6maAXiYwCgYIKoZIzj0EAwIw
+FjEUMBIGA1UEAwwLdGVzdC1jbGllbnQwIBcNMjYwNjAyMDMwNDQ5WhgPMjEyNjA1
+MDkwMzA0NDlaMBYxFDASBgNVBAMMC3Rlc3QtY2xpZW50MFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAECF/Fm+1aykDY3ZBSLbfPJbNS7WwOymDzQLhcMhi46txHc7/e
+ABGOx4r9eNqWRA05b5mO+/6uwBfdfxlZGohbb6NTMFEwHQYDVR0OBBYEFJKwnslZ
+tK2KxyX+FjkY7bAUPQk8MB8GA1UdIwQYMBaAFJKwnslZtK2KxyX+FjkY7bAUPQk8
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhAIp/I0y2neqjCO54
+kxgh+rMMPNnmqgosEjid6IB5wy0IAiBHbZTl7QS1ZMF4l5gjV5w5reZS30wEfiZy
+2eksJ68jgA==
+-----END CERTIFICATE-----
+)PEM";
+
+static const char* kClientKey = R"PEM(-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg4awTUUjQnQU76i4v
+EpK6iyyQdlrOWTNnPwaqmBOvPamhRANCAAQIX8Wb7VrKQNjdkFItt88ls1LtbA7K
+YPNAuFwyGLjq3Edzv94AEY7Hiv142pZEDTlvmY77/q7AF91/GVkaiFtv
+-----END PRIVATE KEY-----
+)PEM";
+
+struct MtlsState {
+    bool present_client_cert = true;  // toggled off for the enforcement case
+    bool server_hs = false;
+    bool client_hs = false;
+    bool server_err = false;
+    bool client_err = false;
+    std::string server_got;
+    std::string client_got;
+};
+
+static void mtls_server_ev(Connection* c, int ev, void*)
+{
+    auto* st = static_cast<MtlsState*>(c->fn_data);
+    if (ev == MG_EV_ACCEPT) {
+        TlsOpts opts{};
+        opts.cert = Str(kTlsCert);
+        opts.key = Str(kTlsKey);
+        opts.ca = Str(kClientCert);  // require + verify the client's cert
+        tls_init(c, &opts);
+    } else if (ev == MG_EV_TLS_HS) {
+        st->server_hs = true;
+    } else if (ev == MG_EV_READ) {
+        drain_recv(c, st->server_got);
+        send_data(c, st->server_got.data(), st->server_got.size());
+    } else if (ev == MG_EV_ERROR) {
+        st->server_err = true;
+    }
+}
+
+static void mtls_client_ev(Connection* c, int ev, void*)
+{
+    auto* st = static_cast<MtlsState*>(c->fn_data);
+    if (ev == MG_EV_CONNECT) {
+        TlsOpts opts{};
+        opts.ca = Str(kTlsCert);       // trust the server's self-signed cert
+        opts.name = Str("localhost");
+        if (st->present_client_cert) {
+            opts.cert = Str(kClientCert);
+            opts.key = Str(kClientKey);
+        }
+        tls_init(c, &opts);
+    } else if (ev == MG_EV_TLS_HS) {
+        st->client_hs = true;
+        send_data(c, "ping", 4);
+    } else if (ev == MG_EV_READ) {
+        drain_recv(c, st->client_got);
+    } else if (ev == MG_EV_ERROR) {
+        st->client_err = true;
+    }
+}
+
+// Pump a fresh client/server pair to a terminal state (success or error),
+// bounded by a wall-clock deadline.
+static void run_mtls_exchange(MtlsState& st, const char* url)
+{
+    Manager mgr;
+    auto* lsn = listen_(mgr.raw(), url, mtls_server_ev, &st);
+    assert(lsn != nullptr);
+    auto* cl = connect(mgr.raw(), url, mtls_client_ev, &st);
+    assert(cl != nullptr);
+
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        mgr.poll(10ms);
+        if (st.client_err || st.server_err)
+            break;
+        if (st.client_got.size() >= 4)
+            break;
+    }
+}
+
+static void test_tls_mutual_auth()
+{
+    assert(tls_available());
+
+    // Positive: client presents a trusted cert -> the server (VERIFY_REQUIRED)
+    // accepts it, both sides complete the handshake, and the echo round-trips.
+    {
+        MtlsState st;
+        st.present_client_cert = true;
+        run_mtls_exchange(st, "https://127.0.0.1:18906");
+        assert(!st.server_err);
+        assert(!st.client_err);
+        assert(st.server_hs);
+        assert(st.client_hs);
+        assert(st.server_got == "ping");
+        assert(st.client_got == "ping");
+    }
+
+    // Negative: client presents NO cert. The server must refuse the handshake.
+    // (Under TLS 1.3 the client may finish its own side and even send early data
+    // before the server's alert arrives, so client_hs is not asserted; what must
+    // hold is that the server rejects the handshake and accepts no plaintext.)
+    // The explicit server_err assert keeps this from passing vacuously if the
+    // connection had simply never been established.
+    {
+        MtlsState st;
+        st.present_client_cert = false;
+        run_mtls_exchange(st, "https://127.0.0.1:18907");
+        assert(st.server_err);          // server actively rejected the peer
+        assert(!st.server_hs);          // server never finished the handshake
+        assert(st.server_got.empty());  // no plaintext reached the server
+        assert(st.client_got.empty());  // and the client got no echo
+    }
+}
+#endif
+
 // ---- Connection methods ----
 
 static void test_connection_send_bytes()
@@ -866,6 +1209,12 @@ int main()
     test_timer_basic();
     test_scoped_enums();
     test_str_constructors();
+    test_check_ip_acl();
+    test_listen_tls_unavailable_fails_closed();
+#if MG_TLS != MG_TLS_NONE
+    test_tls_handshake_end_to_end();
+    test_tls_mutual_auth();
+#endif
     test_connection_send_bytes();
 
     // ShardedManager: verify construction and basic lifecycle

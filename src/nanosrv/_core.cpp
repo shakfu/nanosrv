@@ -143,6 +143,16 @@ static void py_ws_upgrade(PyConn& c, PyHttpMsg& hm, const std::string& headers)
     nanosrv::ws_upgrade(c.get(), hm.get(), "%s", headers.c_str());
 }
 
+// Reject TLS URLs up front with a clear Python exception when this build has no
+// TLS backend, instead of silently failing later at the (stub) handshake.
+static void require_tls_available(std::string_view url)
+{
+    if (nanosrv::url_is_ssl(std::string(url).c_str()) && !nanosrv::tls_available())
+        throw std::runtime_error(
+            "TLS is not available in this build; https:// and wss:// URLs are "
+            "not supported. Use http:// or ws://, or check nanosrv.tls_available().");
+}
+
 static bool py_conn_send_bytes(PyConn& c, std::string_view data)
 {
     return c.get()->send_bytes(data);
@@ -330,6 +340,7 @@ NB_MODULE(_core, m) {
         .def("http_listen",
              [](nanosrv::Manager& mgr, std::string_view url,
                 nb::object callback) -> nanosrv::ConnectionRef {
+                 require_tls_available(url);
                  auto cb = make_callback(std::move(callback));
 
                  HttpHandler handler =
@@ -355,6 +366,7 @@ NB_MODULE(_core, m) {
         .def("http_listen_event",
              [](nanosrv::Manager& mgr, std::string_view url,
                 nb::object callback) -> nanosrv::ConnectionRef {
+                 require_tls_available(url);
                  auto cb = make_callback(std::move(callback));
 
                  HandlerFn handler =
@@ -436,6 +448,7 @@ NB_MODULE(_core, m) {
         .def("http_listen",
              [](nanosrv::ShardedManager& mgr, std::string_view url,
                 nb::object callback) {
+                 require_tls_available(url);
                  auto cb = make_callback(std::move(callback));
 
                  HttpHandler handler =
@@ -538,4 +551,8 @@ NB_MODULE(_core, m) {
 
     // Time
     m.def("millis", &nanosrv::millis, "Return current time in milliseconds.");
+    m.def("tls_available", &nanosrv::tls_available,
+          "Whether this build has a working TLS backend. False in the default "
+          "build, so https:// and wss:// URLs are not supported and listening "
+          "on one raises RuntimeError.");
 }

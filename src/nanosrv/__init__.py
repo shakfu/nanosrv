@@ -33,6 +33,7 @@ from nanosrv._core import (
     set_log_level,
     get_log_level,
     millis,
+    tls_available,
     # JSON submodule
     json,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "set_log_level",
     "get_log_level",
     "millis",
+    "tls_available",
     "json",
 ]
-__version__ = "0.1.0"
+__version__ = "0.1.1"

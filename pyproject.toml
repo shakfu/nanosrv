@@ -1,6 +1,6 @@
 [project]
 name = "nanosrv"
-version = "0.1.0"
+version = "0.1.1"
 description = "An embedded server wrapped with nanobind"
 readme = "README.md"
 license = { text = "MIT" }

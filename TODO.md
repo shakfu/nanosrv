@@ -13,15 +13,31 @@ nice-to-have.
 
 ## P1 -- Security / correctness footguns
 
-- [ ] **IPv6 ACL bypass** (`projects/nanosrv/util.cpp`, `check_ip_acl`). ACLs are
-  not applied to IPv6 peers (early `return` with a `TODO`), so a restrictive ACL
-  silently fails open for half the address space. Implement IPv6 ACL matching, or
-  fail closed and document the limitation loudly.
+- [x] **IPv6 ACL bypass** (`projects/nanosrv/util.cpp`, `check_ip_acl`).
+  Rewrote `check_ip_acl` to match IPv4 and IPv6 uniformly via a bitwise prefix
+  compare over the network-order address bytes; entries (`+net/prefix` /
+  `-net/prefix`) apply only to peers of their own family, and malformed ACLs
+  return an error instead of failing open. Declared in `net.hpp` and covered by
+  C++ tests (allow/deny, CIDR, cross-family, malformed); clean under ASAN/UBSan.
+  NOTE: still a building block -- not wired into the accept path; documented in
+  the README.
 
-- [ ] **TLS is a non-functional stub with no signal** (`projects/nanosrv/tls_dummy.cpp`,
-  `include/nanosrv/tls.hpp`). `tls_init` always errors, so `https://`/`wss://`
-  fail only at runtime. Add a `tls_available()` predicate, make the Python side
-  raise a clear exception for TLS URLs, and state the limitation in the README.
+- [x] **TLS is a non-functional stub with no signal** (`projects/nanosrv/tls_dummy.cpp`,
+  `include/nanosrv/tls.hpp`). Added a `tls_available()` predicate (false in the
+  default build, exposed in the Python module). The Python `http_listen`/
+  `http_listen_event` now raise `RuntimeError` immediately for `https://`/`wss://`
+  URLs instead of failing later at the handshake. README documents the
+  limitation. Covered by Python tests.
+
+- [x] **TLS listener silently downgrades to cleartext** (`projects/nanosrv/sock.cpp:596-602`).
+  An accepted connection inherited `is_tls` from its listener, but because no
+  handler calls `tls_init`, `is_tls_hs` stayed 0 and the accept path reset
+  `c->is_tls = 0` -- so a C++ `http_listen("https://...")` served plaintext on a
+  TLS-intended port. Fixed by failing closed in `listen_` (`net.cpp`): when
+  `url_is_ssl(url) && !tls_available()` it logs and returns null, so a TLS URL
+  never yields a cleartext listener. Covered by a C++ test (`https://`/`wss://`
+  listen returns a null/invalid listener; `http://` still works). This is the
+  C++-side counterpart of the Python `tls_available()` guard above.
 
 - [ ] **DNS transaction-ID de-duplication is a stub** (`projects/nanosrv/dns.cpp:~299`).
   When prior requests exist the new txnid is set to `reqs->txnid + 1` instead of

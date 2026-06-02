@@ -257,7 +257,13 @@ struct Connection* listen_(struct Mgr* mgr, const char* url,
                                 EventHandler fn, void* fn_data)
 {
     struct Connection* c = NULL;
-    if ((c = alloc_conn(mgr)) == NULL) {
+    if (url != NULL && url_is_ssl(url) != 0 && !tls_available()) {
+        // Fail closed. With no TLS backend, an accepted connection on a TLS
+        // listener has its is_tls reset to 0 (no handler calls tls_init), so the
+        // listener would serve cleartext on a port intended for TLS. Refuse to
+        // create the listener rather than silently downgrading to plaintext.
+        MG_ERROR(("TLS not available; refusing to listen on %s", url));
+    } else if ((c = alloc_conn(mgr)) == NULL) {
         MG_ERROR(("OOM %s", url));
     } else if (!open_listener(c, url)) {
         MG_ERROR(("Failed: %s", url));

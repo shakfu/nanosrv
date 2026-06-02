@@ -52,7 +52,7 @@ The project provides six server implementations: five built on the nanosrv netwo
 | HTTP request/response | yes | yes | yes | yes | yes | yes |
 | WebSocket | yes | yes | yes | yes | yes | yes |
 | MQTT | yes | -- | -- | -- | -- | -- |
-| TLS (OpenSSL/mbedTLS) | yes | -- | -- | -- | -- | -- |
+| TLS (mbedTLS) | yes | -- | opt-in | opt-in | -- | -- |
 | Multipart / SSI / OTA | yes | -- | -- | -- | -- | -- |
 | Typed callbacks (no void*) | -- | -- | yes | yes | yes | yes |
 | RAII resource management | -- | -- | yes | yes | yes | yes |
@@ -169,10 +169,33 @@ nanosrv.json.boolean('{"ok": true}', "$.ok")          # True
 | `url_encode(s)` / `url_decode(s)` | URL percent-encoding |
 | `set_log_level(level)` / `get_log_level()` | Control log verbosity |
 | `millis()` | Current time in milliseconds |
+| `tls_available()` | Whether the build has a TLS backend (`False` in the default build; `True` when built with the mbedTLS backend -- see Build Targets) |
 | `json.string(json, path)` | Extract string at JSON path |
 | `json.number(json, path)` | Extract float at JSON path |
 | `json.integer(json, path)` | Extract int at JSON path |
 | `json.boolean(json, path)` | Extract bool at JSON path |
+
+### Limitations & security notes
+
+- **TLS is opt-in (C++ build).** The default build links a no-op TLS stub, so
+  `https://` and `wss://` are not supported: `tls_available()` returns `False`,
+  and calling `http_listen` / `http_listen_event` with a TLS URL raises
+  `RuntimeError` immediately rather than failing later at the handshake. An
+  mbedTLS backend can be enabled when building the C++ library/server with
+  `-DNANOSRV_TLS=mbed` (see Build Targets), after which `tls_available()` is
+  `True` and TLS listeners/clients work. The Python wheel currently ships with
+  the stub (no TLS); terminate TLS in front of nanosrv (e.g. a reverse proxy)
+  when using the bindings.
+- **IP ACLs are not enforced automatically.** The library provides
+  `check_ip_acl()` (C++), which now matches both IPv4 and IPv6 with bitwise
+  prefix comparison -- a previous version returned early for IPv6, so a
+  restrictive ACL silently failed open for IPv6 peers. It is a building block:
+  no listener applies an ACL on its own yet, so wire it into your handler if you
+  need address filtering.
+- **Not yet hardened for hostile networks.** See the connection-hardening knobs
+  (`set_idle_timeout`, `set_request_timeout`, `set_max_body_size`,
+  `set_max_connections`, `set_max_send_buffer`) and the graceful-drain support,
+  but treat exposure to untrusted clients as experimental.
 
 ### Performance
 
@@ -270,6 +293,33 @@ make server-test    # build and run C++ tests via ctest
 make server-clean   # remove CMake build directory
 make bench          # run wrk benchmarks (builds everything first)
 ```
+
+### TLS backend (opt-in)
+
+TLS is off by default. To build the C++ library and servers with TLS, configure
+the CMake project with the mbedTLS backend:
+
+```text
+cmake -B build/cmake -S projects -DNANOSRV_TLS=mbed
+cmake --build build/cmake
+```
+
+mbedTLS is not vendored. By default it is fetched at configure time via CMake
+`FetchContent`, pinned to the v3.6.6 release commit and cached under the build
+tree (so the first configure of the `mbed` backend needs network access; the
+default `none` build never fetches). `NANOSRV_MBEDTLS_PROVIDER` controls the
+source:
+
+```text
+-DNANOSRV_MBEDTLS_PROVIDER=auto     # use an installed mbedTLS if found, else fetch (default)
+-DNANOSRV_MBEDTLS_PROVIDER=system   # require an installed mbedTLS (error if absent)
+-DNANOSRV_MBEDTLS_PROVIDER=fetch    # always fetch the pinned commit
+```
+
+An installed mbedTLS is accepted only in the range `>= 3.6, < 4.0` (the backend
+targets the mbedTLS 3.x API; 4.x is an API break and is skipped). With the
+backend enabled, the C++ test suite adds end-to-end TLS handshake and mutual-TLS
+(client-certificate) tests.
 
 ## License
 
