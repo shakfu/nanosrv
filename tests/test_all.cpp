@@ -1150,7 +1150,25 @@ static void test_sharded_drain_deadline()
     const uint16_t port = 18899;
     ShardedManager sharded(2);
 
-    std::string big(2 * 1024 * 1024, 'x');  // far larger than socket buffers
+    // To exercise the deadline the connection must still have unflushed data
+    // when drain() is called: if the whole response fits in the kernel socket
+    // buffers it is "sent" at once, the connection closes, live_conns_ hits 0,
+    // and drain() returns immediately (so `elapsed >= 250` would fail). The
+    // amount that can be buffered before a write blocks is the server send
+    // buffer plus the client's advertised receive window, and on loopback that
+    // ceiling is large and platform-dependent (Linux autotunes each into the
+    // multi-MB range; a small 2 MB body is swallowed whole). Two measures keep
+    // the connection reliably stuck without making the test slow:
+    //   - the client sets a tiny SO_RCVBUF so its receive window stays small,
+    //     dropping the buffering ceiling close to just the server send buffer;
+    //   - the body (8 MB) exceeds the default Linux send-buffer cap
+    //     (net.ipv4.tcp_wmem max is 4 MB), so a write cannot drain it in full.
+    // The client never reads, so the residue sits unflushed until the deadline
+    // forces run() to return. (Flushing is O(n^2) in bytes sent -- io_send()
+    // memmoves the whole remaining send buffer down after each partial write --
+    // so an over-large body would make even the bounded flush pathologically
+    // slow under the sanitizers; 8 MB keeps that cost small.)
+    std::string big(8 * 1024 * 1024, 'x');
     sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
         [&big](Connection& c, HttpMessage&) {
             http_reply(&c, 200, "Content-Type: text/plain\r\n", "%s",
@@ -1162,6 +1180,8 @@ static void test_sharded_drain_deadline()
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
+    int rcvbuf = 4096;  // tiny receive window so the server blocks early
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
@@ -1169,7 +1189,7 @@ static void test_sharded_drain_deadline()
     assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
     const char* req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     assert(send(fd, req, strlen(req), 0) > 0);
-    std::this_thread::sleep_for(150ms);  // let the 8 MB response queue up unflushed
+    std::this_thread::sleep_for(150ms);  // let the response queue up unflushed
 
     // The stuck connection cannot drain; the deadline must force run() to return.
     uint64_t t0 = millis();
