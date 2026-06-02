@@ -32,6 +32,16 @@ env:
   CIBW_SKIP: "*-musllinux_* pp*"
   CIBW_TEST_REQUIRES: pytest
   CIBW_TEST_COMMAND: pytest {project}/tests -v
+  # The C++ core is built with -std=c++23, so the Linux build needs a compiler
+  # newer than the GCC 10 in the default manylinux2014 image. manylinux_2_28
+  # ships a gcc-toolset >= 12 that supports C++23 (raises the glibc floor to
+  # 2.28, which is fine for a modern server library).
+  CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+  CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+  # nanobind emits C++17 aligned new/delete, which the linker rejects for the
+  # default x86_64 target (10.9). 10.14 clears that; cibuildwheel still tags the
+  # arm64 wheels macosx_11_0 automatically.
+  MACOSX_DEPLOYMENT_TARGET: "10.14"
 
 jobs:
   # ---------------------------------------------------------------------------
