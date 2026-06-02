@@ -1155,33 +1155,31 @@ static void test_sharded_drain_deadline()
     // buffers it is "sent" at once, the connection closes, live_conns_ hits 0,
     // and drain() returns immediately (so `elapsed >= 250` would fail). The
     // amount that can be buffered before a write blocks is the server send
-    // buffer plus the client's advertised receive window, and on loopback that
-    // ceiling is large and platform-dependent (Linux autotunes each into the
-    // multi-MB range; a small 2 MB body is swallowed whole). Two measures keep
-    // the connection reliably stuck without making the test slow:
-    //   - the client sets a tiny SO_RCVBUF so its receive window stays small,
-    //     dropping the buffering ceiling close to just the server send buffer;
-    //   - the body (8 MB) exceeds the default Linux send-buffer cap
-    //     (net.ipv4.tcp_wmem max is 4 MB), so a write cannot drain it in full.
-    // The client never reads, so the residue sits unflushed until the deadline
-    // forces run() to return. (Flushing is O(n^2) in bytes sent -- io_send()
-    // memmoves the whole remaining send buffer down after each partial write --
-    // so an over-large body would make even the bounded flush pathologically
-    // slow under the sanitizers; 8 MB keeps that cost small.)
-    std::string big(8 * 1024 * 1024, 'x');
+    // buffer plus the client's advertised receive window, which on loopback is
+    // large and platform-dependent (Linux autotunes both into the multi-MB
+    // range, so the original 2 MB body was swallowed whole). 32 MB exceeds that
+    // ceiling on both Linux and macOS, so with a client that never reads the
+    // residue stays unflushed until the deadline forces run() to return.
+    //
+    // The body is queued with send_bytes() (a single bulk append) rather than
+    // http_reply(): this test measures the drain deadline, not response
+    // construction, and queuing 32 MB is the point -- not how it is produced.
+    //
+    // The deadline is what bounds the wait, not the flush: a stalled reader
+    // keeps the socket writable, so a worker would otherwise busy-flush the
+    // body, and the per-write iobuf compaction in io_send() makes that
+    // O(n^2) -- pathologically slow under the sanitizers. drain() enforces its
+    // deadline on the workers themselves (see ShardedManager::run()), so the
+    // flush is preempted at ~300 ms regardless of how much is left.
+    std::string big(32 * 1024 * 1024, 'x');
     sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
-        [&big](Connection& c, HttpMessage&) {
-            http_reply(&c, 200, "Content-Type: text/plain\r\n", "%s",
-                       big.c_str());
-        });
+        [&big](Connection& c, HttpMessage&) { c.send_bytes(big); });
 
     std::thread runner([&sharded]() { sharded.run(); });
     std::this_thread::sleep_for(100ms);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
-    int rcvbuf = 4096;  // tiny receive window so the server blocks early
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);

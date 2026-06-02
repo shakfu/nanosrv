@@ -218,8 +218,22 @@ void ShardedManager::run()
                 // in-flight response and close; poll more often so they close
                 // (and live_conns_ drops to 0) promptly.
                 bool draining = draining_.load(std::memory_order_acquire);
-                if (draining)
+                if (draining) {
                     mark_draining(w->raw());
+                    // Enforce the drain deadline here, not only in the acceptor
+                    // loop. A connection with a slow or stalled reader keeps its
+                    // socket writable, so this worker busy-flushes it with the
+                    // poll returning immediately; when every core is spinning on
+                    // such a flush the acceptor thread can be starved long enough
+                    // that it never clears running_ before the work completes,
+                    // and the deadline is missed by seconds. Checking it on the
+                    // worker guarantees a timely stop regardless of scheduling.
+                    uint64_t deadline = drain_deadline_.load(std::memory_order_relaxed);
+                    if (deadline != 0 && millis() >= deadline) {
+                        running_.store(false);
+                        break;
+                    }
+                }
                 w->poll(draining ? 50 : 1000);
             }
         });

@@ -5,8 +5,19 @@ namespace nanosrv {
 static void pfn_iobuf_private(char ch, void* param, bool expand)
 {
     struct IOBuffer* io = static_cast<struct IOBuffer*>(param);
-    if (expand && io->len + 2 > io->size)
-        (void)iobuf_resize(io, io->len + 2);
+    if (expand && io->len + 2 > io->size) {
+        // Grow capacity geometrically. This callback appends one byte at a
+        // time, and iobuf_resize() copies the whole buffer on every growth; if
+        // we only ever asked for `len + 2` the buffer would be reallocated once
+        // per io->align step, making a large printf O(n^2) in the output size
+        // (e.g. a 32 MB http_reply body took ~16 s). Requesting 1.5x the
+        // current capacity keeps the number of reallocations logarithmic, so
+        // building the output is amortized O(n). iobuf_resize() still rounds up
+        // to io->align; `len` (the true data length) is unchanged.
+        size_t want = io->len + 2;
+        size_t grow = io->size + io->size / 2;
+        (void)iobuf_resize(io, want > grow ? want : grow);
+    }
     if (io->len + 2 <= io->size) {
         io->buf[io->len++] = static_cast<uint8_t>(ch);
         io->buf[io->len] = 0;
