@@ -977,7 +977,7 @@ bool wakeup(struct Mgr* mgr, unsigned long conn_id, const void* buf,
     memcpy(extended_buf + sizeof(conn_id), buf, len);
     written = send(mgr->pipe, extended_buf, total, MSG_NONBLOCKING);
     mem_free(extended_buf);
-    return written == static_cast<ssize_t>(total);
+    return written == static_cast<long>(total);
 }
 
 void mgr_poll(struct Mgr* mgr, int ms)
