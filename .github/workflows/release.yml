@@ -1,0 +1,264 @@
+name: Release
+
+# Builds every distributable artifact for a tag and publishes a GitHub Release:
+#   - the nanosrv Python wheels (cibuildwheel matrix) + sdist
+#   - the native bundle per platform: libnanosrv.a, libmungo.a and the C/C++
+#     executables (nanosrv-server, nanosrv-sharded, mungo-server), packed as
+#     nanosrv-<version>-<os>-<arch>.tar.gz
+# Publishing the wheels + sdist to PyPI is an opt-in job (workflow_dispatch only),
+# so this workflow does not collide with build-publish.yml's automatic PyPI push.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build the release for, e.g. v0.1.1"
+        required: true
+        type: string
+      publish_pypi:
+        description: "Also publish wheels + sdist to PyPI"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+  CIBW_SKIP: "*-musllinux_* pp*"
+  CIBW_TEST_REQUIRES: pytest
+  CIBW_TEST_COMMAND: pytest {project}/tests -v
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the tag / version once so every downstream job agrees.
+  # ---------------------------------------------------------------------------
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+    steps:
+      - id: r
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Source distribution.
+  # ---------------------------------------------------------------------------
+  sdist:
+    name: Build sdist
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Python wheels (the nanosrv wheel), one runner per platform.
+  # ---------------------------------------------------------------------------
+  wheels:
+    name: Wheels (${{ matrix.os }})
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archs: "x86_64 aarch64"
+          - os: macos-latest
+            archs: "x86_64 arm64"
+          - os: windows-latest
+            archs: "AMD64"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      # Register QEMU so cibuildwheel can build the emulated linux aarch64 wheels.
+      - name: Set up QEMU
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  # ---------------------------------------------------------------------------
+  # Native bundle: static libs + C/C++ executables, versioned per platform.
+  # ---------------------------------------------------------------------------
+  native:
+    name: Native (${{ matrix.os }})
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Build C/C++ targets
+        run: |
+          cmake -B build/cmake -S projects -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/cmake --config Release --parallel
+
+      - name: Package native bundle
+        id: pkg
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          case "${{ runner.os }}" in
+            Linux) os=linux ;;
+            macOS) os=macos ;;
+            *)     os=unknown ;;
+          esac
+          arch="$(uname -m)"
+          name="nanosrv-${VERSION}-${os}-${arch}"
+          stage="staging/${name}"
+          mkdir -p "${stage}/bin" "${stage}/lib"
+
+          # Executables and libraries land in build/ (see projects/CMakeLists.txt).
+          for exe in nanosrv-server nanosrv-sharded mungo-server; do
+            [ -f "build/${exe}" ] && cp "build/${exe}" "${stage}/bin/"
+          done
+          for lib in libnanosrv.a libmungo.a; do
+            [ -f "build/${lib}" ] && cp "build/${lib}" "${stage}/lib/"
+          done
+
+          # Strip the executables only -- stripping the static archives would
+          # drop the symbols consumers need to link against them.
+          for exe in "${stage}/bin/"*; do
+            [ -f "${exe}" ] && strip "${exe}" || true
+          done
+
+          # Public headers make libnanosrv.a usable; ship LICENSE/README too.
+          [ -d include ] && cp -R include "${stage}/include"
+          cp LICENSE README.md "${stage}/" 2>/dev/null || true
+
+          tar -C staging -czf "${name}.tar.gz" "${name}"
+          echo "Packed ${name}.tar.gz:"
+          tar -tzf "${name}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}
+          path: nanosrv-*.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Create the GitHub Release with all artifacts + changelog notes.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [meta, sdist, wheels, native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Extract changelog section
+        id: notes
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          notes_file="$(mktemp)"
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") { capture = 1; next }
+            capture && /^## \[/        { exit }
+            capture                    { print }
+          ' CHANGELOG.md > "$notes_file"
+          if [ ! -s "$notes_file" ]; then
+            printf 'Release %s\n' "$TAG" > "$notes_file"
+            echo "::warning::No CHANGELOG.md section for $VERSION; using a placeholder."
+          fi
+          echo "path=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Detect pre-release
+        id: prerelease
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          if printf '%s' "$TAG" | grep -Eiq -- '-(rc|alpha|beta|dev|pre)'; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.path }}
+          prerelease: ${{ steps.prerelease.outputs.value }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.whl
+            release-assets/*.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Optional: publish wheels + sdist to PyPI (manual opt-in only).
+  # ---------------------------------------------------------------------------
+  pypi-publish:
+    name: Publish to PyPI
+    needs: [meta, sdist, wheels]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nanosrv
+    permissions:
+      id-token: write # trusted publishing (OIDC); no API token needed
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
