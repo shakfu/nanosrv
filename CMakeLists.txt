@@ -5,6 +5,16 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The nanosrv static library is linked into the _core *shared* module below.
+# On ELF targets (Linux) a static archive can only be linked into a shared
+# object if its objects were compiled position-independent; otherwise the link
+# fails with "relocation R_X86_64_PC32 ... can not be used when making a shared
+# object; recompile with -fPIC". macOS compiles PIC unconditionally so this is
+# not needed there, but the flag is harmless and keeps the wheel build portable.
+# Scoped to this (wheel) build only -- the standalone executables built from
+# projects/CMakeLists.txt do not need it.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Build the nanosrv library (needed by the Python extension)
 add_subdirectory(projects/nanosrv)
 
