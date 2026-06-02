@@ -14,6 +14,7 @@ import nanosrv
 # Enum tests
 # ---------------------------------------------------------------------------
 
+
 class TestEnums:
     def test_event_values(self):
         assert nanosrv.Event.Error.value == 0
@@ -42,6 +43,7 @@ class TestEnums:
 # ---------------------------------------------------------------------------
 # URL parsing tests
 # ---------------------------------------------------------------------------
+
 
 class TestUrl:
     def test_parse_http(self):
@@ -73,6 +75,7 @@ class TestUrl:
 # Base64 tests
 # ---------------------------------------------------------------------------
 
+
 class TestBase64:
     def test_encode(self):
         assert nanosrv.base64_encode("hello") == "aGVsbG8="
@@ -92,6 +95,7 @@ class TestBase64:
 # ---------------------------------------------------------------------------
 # URL encode/decode tests
 # ---------------------------------------------------------------------------
+
 
 class TestUrlEncodeDecode:
     def test_encode(self):
@@ -114,6 +118,7 @@ class TestUrlEncodeDecode:
 # ---------------------------------------------------------------------------
 # JSON parsing tests
 # ---------------------------------------------------------------------------
+
 
 class TestJson:
     def test_number(self):
@@ -146,6 +151,7 @@ class TestJson:
 # Logging tests
 # ---------------------------------------------------------------------------
 
+
 class TestLogging:
     def test_set_get_log_level(self):
         original = nanosrv.get_log_level()
@@ -154,9 +160,13 @@ class TestLogging:
         nanosrv.set_log_level(original)
 
     def test_all_levels(self):
-        for level in [getattr(nanosrv.LogLevel, "None"), nanosrv.LogLevel.Error,
-                      nanosrv.LogLevel.Info, nanosrv.LogLevel.Debug,
-                      nanosrv.LogLevel.Verbose]:
+        for level in [
+            getattr(nanosrv.LogLevel, "None"),
+            nanosrv.LogLevel.Error,
+            nanosrv.LogLevel.Info,
+            nanosrv.LogLevel.Debug,
+            nanosrv.LogLevel.Verbose,
+        ]:
             nanosrv.set_log_level(level)
             assert nanosrv.get_log_level() == level
         nanosrv.set_log_level(getattr(nanosrv.LogLevel, "None"))
@@ -165,6 +175,7 @@ class TestLogging:
 # ---------------------------------------------------------------------------
 # Millis test
 # ---------------------------------------------------------------------------
+
 
 class TestMillis:
     def test_returns_positive(self):
@@ -213,6 +224,7 @@ class TestTls:
 # Manager tests
 # ---------------------------------------------------------------------------
 
+
 class TestManager:
     def test_create(self):
         mgr = nanosrv.Manager()
@@ -227,6 +239,7 @@ class TestManager:
 # HTTP server integration test
 # ---------------------------------------------------------------------------
 
+
 class TestHttpServer:
     def test_request_response(self):
         mgr = nanosrv.Manager()
@@ -236,8 +249,7 @@ class TestHttpServer:
             received["method"] = msg.method
             received["uri"] = msg.uri
             received["body"] = msg.body
-            conn.http_reply(200, "Content-Type: text/plain\r\n",
-                            f"echo:{msg.uri}")
+            conn.http_reply(200, "Content-Type: text/plain\r\n", f"echo:{msg.uri}")
 
         ref = mgr.http_listen("http://0.0.0.0:18321", handler)
         assert ref
@@ -320,9 +332,7 @@ class TestHttpServer:
 
         try:
             time.sleep(0.05)
-            resp = urllib.request.urlopen(
-                "http://127.0.0.1:18323/path?key=val"
-            )
+            resp = urllib.request.urlopen("http://127.0.0.1:18323/path?key=val")
             resp.read()
             assert "GET" in captured["repr"]
             assert "key=val" in captured["query"]
@@ -335,6 +345,7 @@ class TestHttpServer:
 # ---------------------------------------------------------------------------
 # Connection properties test
 # ---------------------------------------------------------------------------
+
 
 class TestConnectionProperties:
     def test_connection_flags(self):
@@ -367,7 +378,9 @@ class TestConnectionProperties:
 
             assert props["id"] > 0
             assert props["is_websocket"] is False
-            assert props["is_listening"] is False  # handler conn is accepted, not the listener
+            assert (
+                props["is_listening"] is False
+            )  # handler conn is accepted, not the listener
             assert props["is_tls"] is False
             assert props["is_accepted"] is True
         finally:
@@ -380,6 +393,7 @@ class TestConnectionProperties:
 # during that call. Storing one and using it afterwards must raise, not crash
 # (use-after-free). To act on a connection later, keep conn.id + Manager.wakeup.
 # ---------------------------------------------------------------------------
+
 
 class TestCallbackObjectLifetime:
     def _run_request(self, port, handler):
@@ -405,7 +419,7 @@ class TestCallbackObjectLifetime:
         escaped = {}
 
         def handler(conn, msg):
-            escaped["msg"] = msg          # smuggle the transient view out
+            escaped["msg"] = msg  # smuggle the transient view out
             conn.http_reply(200, "", "ok")
 
         self._run_request(18331, handler)
@@ -421,8 +435,8 @@ class TestCallbackObjectLifetime:
         escaped = {}
 
         def handler(conn, msg):
-            escaped["conn"] = conn        # smuggle the connection out
-            escaped["id"] = conn.id       # reading inside the callback is fine
+            escaped["conn"] = conn  # smuggle the connection out
+            escaped["id"] = conn.id  # reading inside the callback is fine
             conn.http_reply(200, "", "ok")
 
         self._run_request(18332, handler)
@@ -456,8 +470,9 @@ class TestCallbackObjectLifetime:
         mgr = nanosrv.Manager()
         mgr.set_idle_timeout(150)
         assert mgr.idle_timeout == 150
-        mgr.http_listen("http://127.0.0.1:18360",
-                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+        mgr.http_listen(
+            "http://127.0.0.1:18360", lambda conn, msg: conn.http_reply(200, "", "ok")
+        )
 
         stop = threading.Event()
 
@@ -489,8 +504,9 @@ class TestCallbackObjectLifetime:
         mgr.set_request_timeout(200)
         mgr.set_idle_timeout(5000)
         assert mgr.request_timeout == 200
-        mgr.http_listen("http://127.0.0.1:18361",
-                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+        mgr.http_listen(
+            "http://127.0.0.1:18361", lambda conn, msg: conn.http_reply(200, "", "ok")
+        )
 
         stop = threading.Event()
 
@@ -574,8 +590,9 @@ class TestCallbackObjectLifetime:
         mgr = nanosrv.Manager()
         mgr.set_max_connections(2)
         assert mgr.max_connections == 2
-        mgr.http_listen("http://127.0.0.1:18364",
-                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+        mgr.http_listen(
+            "http://127.0.0.1:18364", lambda conn, msg: conn.http_reply(200, "", "ok")
+        )
 
         stop = threading.Event()
 
@@ -602,7 +619,7 @@ class TestCallbackObjectLifetime:
                     if s.recv(16) == b"":
                         eofs += 1  # server closed this one (rejected)
                 except BlockingIOError:
-                    pass             # still open, no data pending
+                    pass  # still open, no data pending
             assert eofs == 1, f"expected one rejected conn, got {eofs}"
         finally:
             for s in socks:
@@ -625,7 +642,8 @@ class TestCallbackObjectLifetime:
         mgr.http_listen(
             "http://127.0.0.1:18365",
             lambda conn, msg: conn.http_reply(
-                200, "Content-Type: text/plain\r\n", body),
+                200, "Content-Type: text/plain\r\n", body
+            ),
         )
 
         stop = threading.Event()
@@ -652,7 +670,8 @@ class TestCallbackObjectLifetime:
                 total += len(chunk)
             s.close()
             assert total < body_size, (
-                f"expected truncated response, read {total} of {body_size}")
+                f"expected truncated response, read {total} of {body_size}"
+            )
             assert mgr.num_connections == 0
         finally:
             stop.set()
@@ -664,8 +683,9 @@ class TestCallbackObjectLifetime:
         import socket
 
         mgr = nanosrv.Manager()
-        mgr.http_listen("http://127.0.0.1:18367",
-                        lambda conn, msg: conn.http_reply(200, "", "ok"))
+        mgr.http_listen(
+            "http://127.0.0.1:18367", lambda conn, msg: conn.http_reply(200, "", "ok")
+        )
 
         # Open an idle keep-alive connection and let it be accepted.
         s = socket.create_connection(("127.0.0.1", 18367), timeout=2)
@@ -696,7 +716,6 @@ class TestCallbackObjectLifetime:
     def test_sharded_drain_finishes_inflight(self):
         # ShardedManager.drain() (thread-safe) must let an in-flight request
         # finish, then make run() return on its own.
-        import socket
 
         mgr = nanosrv.ShardedManager(2)
         served = {"n": 0}
@@ -723,8 +742,8 @@ class TestCallbackObjectLifetime:
 
         ct = threading.Thread(target=client)
         ct.start()
-        time.sleep(0.1)     # request is sent, handler is sleeping
-        mgr.drain(3000)     # graceful: let the in-flight request complete
+        time.sleep(0.1)  # request is sent, handler is sleeping
+        mgr.drain(3000)  # graceful: let the in-flight request complete
 
         ct.join()
         runner.join(timeout=5)
@@ -752,10 +771,10 @@ class TestCallbackObjectLifetime:
         mgr.http_listen("http://0.0.0.0:18350", cb)
         mgr.poll(0)
 
-        del cb           # drop our strong ref; the listener still holds one
+        del cb  # drop our strong ref; the listener still holds one
         gc.collect()
         assert ref() is not None, "callback dropped while listener is open"
 
-        del mgr          # closing the listener must release the callback
+        del mgr  # closing the listener must release the callback
         gc.collect()
         assert ref() is None, "callback leaked after Manager teardown"

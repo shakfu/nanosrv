@@ -44,3 +44,13 @@ sdist.include = []
 sdist.exclude = []
 wheel.exclude = []
 
+[tool.mypy]
+# The public API is re-exported from the compiled nanobind extension
+# nanosrv._core, which ships no type stubs. The package itself is marked typed
+# (py.typed), so mypy flags the stubless extension as [import-untyped]; this
+# override silences that for the one C module without turning off type checking
+# for the rest of the package.
+[[tool.mypy.overrides]]
+module = "nanosrv._core"
+ignore_missing_imports = true
+
