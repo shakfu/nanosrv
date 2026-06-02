@@ -47,7 +47,15 @@ add_library(nanosrv
 target_include_directories(nanosrv
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>
 )
-target_compile_options(nanosrv PRIVATE -Wall -Wextra -O2)
+# MSVC does not understand the GCC/Clang -W flags (`-Wextra` parses as `/W`
+# with a bogus numeric argument and fails with D8021); use its own warning
+# level instead. This matters because the nanosrv static library is part of the
+# Python wheel, which is built with MSVC on Windows.
+if(MSVC)
+    target_compile_options(nanosrv PRIVATE /W4)
+else()
+    target_compile_options(nanosrv PRIVATE -Wall -Wextra -O2)
+endif()
 
 # ---------------------------------------------------------------------------
 # mbedTLS backend (opt-in via -DNANOSRV_TLS=mbed)
@@ -178,7 +186,11 @@ endif()
 # Tests
 # ---------------------------------------------------------------------------
 set(_test_src "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_all.cpp")
-if(EXISTS "${_test_src}")
+# Skip the C++ test executable when building the Python wheel: scikit-build-core
+# (which defines SKBUILD_PROJECT_NAME) only needs the nanosrv library and the
+# _core extension, and the test binary is a dev artifact that would otherwise be
+# compiled on every wheel build, including the MSVC/Windows leg.
+if(EXISTS "${_test_src}" AND NOT DEFINED SKBUILD_PROJECT_NAME)
     enable_testing()
     add_executable(nanosrv-tests "${_test_src}")
     target_link_libraries(nanosrv-tests PRIVATE nanosrv)
