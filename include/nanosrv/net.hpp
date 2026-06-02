@@ -297,9 +297,16 @@ public:
     ConnectionRef connect(std::string_view url, HandlerFn handler);
 
     // Template overload declared in http.hpp (needs http_listen free function visible)
+    // NOTE: the requires-clause must be spelled identically here and at the
+    // out-of-class definition in http.hpp -- MSVC matches a constrained member
+    // template to its definition by the textual form of the constraint. The
+    // HttpHandler alias is expanded to its std::function type so both sites read
+    // the same regardless of scope (the definition lives at namespace scope and
+    // cannot name the unqualified member alias).
     template<typename F>
         requires (!std::same_as<std::decay_t<F>, HandlerFn>
-              && !std::same_as<std::decay_t<F>, HttpHandler>)
+              && !std::same_as<std::decay_t<F>,
+                               std::function<void(Connection&, HttpMessage&)>>)
     ConnectionRef http_listen(std::string_view url, F&& handler);
 
     // Wakeup a connection by ID

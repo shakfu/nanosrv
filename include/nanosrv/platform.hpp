@@ -1,5 +1,12 @@
 #pragma once
 
+// rand_s() (used for randomness on Windows in util.cpp) is only declared by
+// <stdlib.h> when _CRT_RAND_S is defined *before* the first include of it.
+// Define it here, ahead of every include, so the MSVC build sees the prototype.
+#if defined(_WIN32) && !defined(_CRT_RAND_S)
+#define _CRT_RAND_S
+#endif
+
 // ---------------------------------------------------------------------------
 // Architecture detection (UNIX and WIN32 only)
 // ---------------------------------------------------------------------------

@@ -76,7 +76,8 @@ std::string url_decode(std::string_view input);
 // Defined here because it needs the http_listen() free function declaration above.
 template<typename F>
     requires (!std::same_as<std::decay_t<F>, HandlerFn>
-          && !std::same_as<std::decay_t<F>, Manager::HttpHandler>)
+          && !std::same_as<std::decay_t<F>,
+                           std::function<void(Connection&, HttpMessage&)>>)
 ConnectionRef Manager::http_listen(std::string_view url, F&& handler) {
     using Handler = std::decay_t<F>;
     auto* h = new Handler(std::forward<F>(handler));

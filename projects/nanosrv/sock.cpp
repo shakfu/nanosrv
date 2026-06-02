@@ -960,7 +960,10 @@ bool wakeup_init(struct Mgr* mgr)
 bool wakeup(struct Mgr* mgr, unsigned long conn_id, const void* buf,
                size_t len)
 {
-    ssize_t written = -1;
+    // `long` rather than ssize_t: ssize_t is POSIX-only (undeclared under MSVC),
+    // and send() returns int on Windows / ssize_t on POSIX, both of which fit a
+    // long for the small control messages sent over the wakeup pipe.
+    long written = -1;
     if (mgr->pipe == MG_INVALID_SOCKET || conn_id == 0
         || len > SIZE_MAX - sizeof(conn_id)) {
         return false;
