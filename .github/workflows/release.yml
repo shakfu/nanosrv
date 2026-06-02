@@ -5,8 +5,9 @@ name: Release
 #   - the native bundle per platform: libnanosrv.a, libmungo.a and the C/C++
 #     executables (nanosrv-server, nanosrv-sharded, mungo-server), packed as
 #     nanosrv-<version>-<os>-<arch>.tar.gz
-# Publishing the wheels + sdist to PyPI is an opt-in job (workflow_dispatch only),
-# so this workflow does not collide with build-publish.yml's automatic PyPI push.
+# The per-platform matrix artifacts are merged into a single `wheels` download
+# and a single `executables` download (the collect-* jobs below). Publishing
+# wheels + sdist to PyPI is an opt-in job (workflow_dispatch only).
 
 on:
   push:
@@ -185,11 +186,43 @@ jobs:
           path: nanosrv-*.tar.gz
 
   # ---------------------------------------------------------------------------
+  # Merge the per-platform matrix artifacts into single downloads: one `wheels`
+  # artifact (all .whl) and one `executables` artifact (all native bundles).
+  # upload-artifact@v4 artifacts are immutable, so each matrix leg uploads under
+  # a unique name and these jobs collapse them with delete-merged, leaving just
+  # the two consolidated artifacts in the run.
+  # ---------------------------------------------------------------------------
+  collect-wheels:
+    name: Collect wheels
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact/merge@v4
+        with:
+          name: wheels
+          pattern: wheels-*
+          delete-merged: true
+
+  collect-executables:
+    name: Collect executables
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact/merge@v4
+        with:
+          name: executables
+          pattern: native-*
+          delete-merged: true
+
+  # ---------------------------------------------------------------------------
   # Create the GitHub Release with all artifacts + changelog notes.
   # ---------------------------------------------------------------------------
   release:
     name: Create GitHub Release
-    needs: [meta, sdist, wheels, native]
+    # Depend on the collect-* jobs (not the raw matrix) so the per-platform
+    # artifacts have been merged/deleted before we download; otherwise the
+    # download could race the merge and pull duplicates.
+    needs: [meta, sdist, collect-wheels, collect-executables]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -253,7 +286,7 @@ jobs:
   # ---------------------------------------------------------------------------
   pypi-publish:
     name: Publish to PyPI
-    needs: [meta, sdist, wheels]
+    needs: [meta, sdist, collect-wheels]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_pypi }}
     runs-on: ubuntu-latest
     environment:
@@ -265,9 +298,8 @@ jobs:
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
+          name: wheels
           path: dist
-          merge-multiple: true
       - name: Download sdist
         uses: actions/download-artifact@v4
         with:

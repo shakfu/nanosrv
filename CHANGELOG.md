@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The GitHub release body for a tag is now extracted from this changelog's matching version section (`scripts/release_notes.py`), falling back to GitHub's auto-generated commit notes when no section is found
+
+- The release workflow merges the per-platform matrix outputs into a single `wheels` download and a single `executables` download, and the overlapping `build-publish.yml` workflow was removed so a tag push no longer triggers two publish pipelines
+
+### Fixed
+
+- Quadratic response construction: assembling a response body through the formatted-output path (`http_reply`, WebSocket sends -- anything that `xprintf`s into a connection's send buffer) grew the buffer one `MG_IO_SIZE` (16 KB) step at a time and copied the whole buffer on every growth, making an N-byte body O(N^2) to build (a 32 MB body took ~16 s under the sanitizers). The buffer now grows geometrically, so building output is amortized O(N)
+
+- `ShardedManager::drain(timeout_ms)` could overshoot its deadline by many seconds when a connection with a stalled reader kept a worker busy flushing: the deadline was only checked on the acceptor thread, which the spinning workers could starve. It is now also enforced inside each worker loop, so `drain()` returns within roughly the timeout regardless of worker load
+
+- The C++ core now compiles under MSVC and on the manylinux C++23 toolchain, so prebuilt Python wheels are produced for Linux, macOS, and Windows. The static library is built position-independent so it links into the `_core` extension module; the Linux wheel uses the `manylinux_2_28` image (GCC >= 12 supports the `-std=c++23` the core requires; the default `manylinux2014` ships GCC 10); the macOS wheel targets `MACOSX_DEPLOYMENT_TARGET=10.14` so nanobind's aligned `new`/`delete` links; and the MSVC build no longer trips over GCC/Clang-only warning flags, POSIX `ssize_t`, `rand_s` used without `_CRT_RAND_S`, or a constrained-template definition spelled differently from its declaration
+
 ## [0.1.1]
 
 ### Added

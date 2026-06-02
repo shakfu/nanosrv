@@ -77,8 +77,8 @@ nice-to-have.
   fixed a pre-existing wakeup-pipe race in `stop()`/`drain()`.
 
 - [ ] **Python version matrix mismatch** (`pyproject.toml` requires `>=3.10` but
-  `.github/workflows/ci-py.yml` matrix and `build-publish.yml` `CIBW_BUILD` build
-  cp39). Align the matrix and `CIBW_BUILD` with `requires-python`.
+  `.github/workflows/ci-py.yml` still tests Python 3.9). Align the matrix with
+  `requires-python`. (`release.yml` already builds cp310+.)
 
 - [ ] **Logging defaults verbose and always compiled in** (`projects/nanosrv/log.cpp`). Default the runtime level to Info/Error and add a compile-time floor that compiles out sub-threshold `MG_DEBUG`/`MG_VERBOSE` calls.
 
