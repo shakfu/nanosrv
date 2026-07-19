@@ -130,8 +130,12 @@ static void iolog(struct Connection* c, char* buf, long n, bool r)
         }
         if (r) {
             c->recv.len += (size_t)n;
+            c->mgr->stat_bytes_read.fetch_add((uint64_t)n,
+                                              std::memory_order_relaxed);
             call(c, MG_EV_READ, &n);
         } else {
+            c->mgr->stat_bytes_written.fetch_add((uint64_t)n,
+                                                 std::memory_order_relaxed);
             iobuf_del(&c->send, 0, (size_t)n);
             // if (c->send.len == 0) iobuf_resize(&c->send, 0);
             if (c->send.len == 0) {
@@ -586,6 +590,7 @@ static void accept_conn(struct Mgr* mgr, struct Connection* lsn)
         setsockopts(c);
         c->is_accepted = 1;
         mgr->num_accepted++;  // live count for the max_connections cap
+        mgr->stat_accepted.fetch_add(1, std::memory_order_relaxed);  // metrics
         c->is_hexdumping = lsn->is_hexdumping;
         setlocaddr(fd,
                    &c->loc); // set local addr to where the client connected to
@@ -619,6 +624,15 @@ static bool skip_iotest(const struct Connection* c)
         || (can_read(c) == false && can_write(c) == false);
 }
 
+// Upper bound on readiness events harvested per iotest() call. The epoll/kqueue
+// readiness arrays were sized to the connection count and stack-allocated with
+// alloca(), so a very large connection count meant a very large stack frame.
+// A fixed batch caps stack use to a constant: epoll and kqueue are
+// level-triggered, so any ready fds beyond the batch simply surface on the next
+// iotest() call. The poll() path (below) still needs one entry per fd in a
+// single syscall, so it falls back to a heap buffer past this size.
+static constexpr int MG_IO_POLL_BATCH = 256;
+
 static void iotest(struct Mgr* mgr, int ms)
 {
 #if MG_ENABLE_FREERTOS_TCP
@@ -644,7 +658,6 @@ static void iotest(struct Mgr* mgr, int ms)
                             eSELECT_READ | eSELECT_EXCEPT | eSELECT_WRITE);
     }
 #elif MG_ENABLE_EPOLL
-    size_t max = 1;
     for (struct Connection* c = mgr->conns; c != NULL; c = c->next) {
         c->is_readable = c->is_writable = 0;
         if (c->rtls.len > 0 || tls_pending(c) > 0)
@@ -653,11 +666,11 @@ static void iotest(struct Mgr* mgr, int ms)
             MG_EPOLL_MOD(c, 1);
         if (c->is_closing)
             ms = 1;
-        max++;
     }
-    struct epoll_event* evs = static_cast<struct epoll_event*>(alloca(max
-                                                          * sizeof(evs[0])));
-    int n = epoll_wait(mgr->epoll_fd, evs, static_cast<int>(max), ms);
+    // Fixed-size batch on the stack (see MG_IO_POLL_BATCH). Level-triggered, so
+    // any ready fds beyond the batch return on the next epoll_wait().
+    struct epoll_event evs[MG_IO_POLL_BATCH];
+    int n = epoll_wait(mgr->epoll_fd, evs, MG_IO_POLL_BATCH, ms);
     for (int i = 0; i < n; i++) {
         struct Connection* c = static_cast<struct Connection*>(evs[i].data.ptr);
         if (evs[i].events & EPOLLERR) {
@@ -673,7 +686,6 @@ static void iotest(struct Mgr* mgr, int ms)
     }
     (void)skip_iotest;
 #elif MG_ENABLE_KQUEUE
-    size_t max = 1;
     for (struct Connection* c = mgr->conns; c != NULL; c = c->next) {
         c->is_readable = c->is_writable = 0;
         if (c->rtls.len > 0 || tls_pending(c) > 0)
@@ -682,16 +694,14 @@ static void iotest(struct Mgr* mgr, int ms)
             MG_KQUEUE_MOD(c, 1);
         if (c->is_closing)
             ms = 1;
-        max++;
     }
-    // kqueue delivers separate events per filter (READ, WRITE), so we
-    // may get up to 2 events per connection.
-    struct kevent* evs = static_cast<struct kevent*>(
-        alloca(max * 2 * sizeof(evs[0])));
+    // Fixed-size batch on the stack (see MG_IO_POLL_BATCH). kqueue delivers a
+    // separate event per filter (READ, WRITE) and is level-triggered, so any
+    // events beyond the batch return on the next kevent().
+    struct kevent evs[MG_IO_POLL_BATCH];
     struct timespec ts = {static_cast<time_t>(ms / 1000),
                           static_cast<long>((ms % 1000) * 1000000L)};
-    int n = kevent(mgr->epoll_fd, NULL, 0, evs,
-                   static_cast<int>(max * 2), &ts);
+    int n = kevent(mgr->epoll_fd, NULL, 0, evs, MG_IO_POLL_BATCH, &ts);
     for (int i = 0; i < n; i++) {
         auto* c = static_cast<struct Connection*>(evs[i].udata);
         if (c == nullptr) continue;
@@ -764,7 +774,15 @@ static void iotest(struct Mgr* mgr, int ms)
     nfds_t n = 0;
     for (struct Connection* c = mgr->conns; c != NULL; c = c->next)
         n++;
-    struct pollfd* fds = static_cast<struct pollfd*>(alloca(n * sizeof(fds[0])));
+    // poll() needs one entry per fd in a single call, so it cannot be batched
+    // like epoll/kqueue. Use alloca() for the common (small) case, but fall back
+    // to the heap once the array would make the stack frame too large.
+    bool fds_on_heap = n > (nfds_t)MG_IO_POLL_BATCH;
+    struct pollfd* fds = fds_on_heap
+        ? static_cast<struct pollfd*>(calloc(n, sizeof(struct pollfd)))
+        : static_cast<struct pollfd*>(alloca(n * sizeof(struct pollfd)));
+    if (fds == NULL)
+        return;  // heap allocation failed: skip this poll cycle
     memset(fds, 0, n * sizeof(fds[0]));
     n = 0;
     for (struct Connection* c = mgr->conns; c != NULL; c = c->next) {
@@ -812,6 +830,8 @@ static void iotest(struct Mgr* mgr, int ms)
             n++;
         }
     }
+    if (fds_on_heap)
+        free(fds);
 #else
     struct timeval tv = { ms / 1000, (ms % 1000) * 1000 },
                    tv_1ms = { 0, 1000 }, *tvp;
@@ -943,7 +963,7 @@ bool wakeup_init(struct Mgr* mgr)
         struct Connection* c = NULL;
         if (!socketpair_(sp, usa)) {
             MG_ERROR(("Cannot create socket pair"));
-        } else if ((c = wrapfd(mgr, (int)sp[1], wufn, NULL)) == NULL) {
+        } else if ((c = wrapfd(mgr, sp[1], wufn, NULL)) == NULL) {
             closesocket(sp[0]);
             closesocket(sp[1]);
             sp[0] = sp[1] = MG_INVALID_SOCKET;
@@ -1040,6 +1060,21 @@ void mgr_poll(struct Mgr* mgr, int ms)
             } else if (c->recv_deadline == 0) {
                 c->recv_deadline = now + (uint64_t)mgr->request_timeout_ms;
             } else if (now > c->recv_deadline) {
+                c->is_closing = 1;
+            }
+        }
+        // Connect deadline: bound a hung outbound connection. A client-initiated
+        // connection that has not finished resolving + connecting within
+        // connect_timeout_ms is closed. Scoped to client connections still in
+        // the resolving/connecting phase; the deadline is armed lazily and
+        // cleared once the connection is established.
+        if (mgr->connect_timeout_ms > 0 && c->is_client && !c->is_closing) {
+            if (!c->is_connecting && !c->is_resolving) {
+                c->connect_deadline = 0;
+            } else if (c->connect_deadline == 0) {
+                c->connect_deadline = now + (uint64_t)mgr->connect_timeout_ms;
+            } else if (now > c->connect_deadline) {
+                MG_ERROR(("%lu connect timeout", c->id));
                 c->is_closing = 1;
             }
         }

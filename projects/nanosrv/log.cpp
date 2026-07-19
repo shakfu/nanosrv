@@ -5,7 +5,12 @@ namespace nanosrv {
 
 // ---- module: log ----
 
-int log_level = MG_LL_DEBUG;
+// Default to Info: errors and informational lines, but not the per-connection
+// Debug/Verbose chatter. Raise at runtime with mg_log_set(MG_LL_DEBUG) when
+// diagnosing. Note the compile-time floor MG_LOG_LEVEL_MAX (platform.hpp) may
+// already have compiled out Debug/Verbose sites in a release build, in which
+// case raising this has no effect on them.
+int log_level = MG_LL_INFO;
 static PrintFn s_log_func = pfn_stdout;
 static void* s_log_func_param = NULL;
 static std::recursive_mutex s_log_mutex;

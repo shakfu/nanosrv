@@ -109,6 +109,11 @@ struct Mgr {
     // completed it within this window is closed (defends against slow-dribble
     // slowloris, which keeps the idle timer alive by trickling bytes).
     int request_timeout_ms;
+    // Connect deadline (ms) for client-initiated connections. 0 = disabled.
+    // A client connection that has not finished resolving + connecting within
+    // this window is closed (bounds a hung outbound connect()). Defaults to
+    // MG_DEFAULT_CONNECT_TIMEOUT_MS.
+    int connect_timeout_ms;
     // Maximum request body size in bytes for accepted connections. 0 = disabled.
     // A request whose Content-Length (or de-chunked body) exceeds this is
     // rejected with 413; an oversized Content-Length is rejected before the body
@@ -125,6 +130,16 @@ struct Mgr {
     // A connection whose unsent outbound backlog (send.len) exceeds this is
     // closed (defends against a slow/stalled reader tying up send buffering).
     size_t max_send_buffer;
+    // Lightweight cumulative observability counters. A Manager's own event loop
+    // writes these single-threaded, but ShardedManager sums them across worker
+    // threads while those workers run, so they are atomic to keep that read
+    // race-free (relaxed ordering is sufficient for monotonic counters). The
+    // memset in mgr_init zero-initializes them (valid for integral atomics).
+    std::atomic<uint64_t> stat_accepted;      // accepted connections, total
+    std::atomic<uint64_t> stat_closed;        // accepted connections closed, total
+    std::atomic<uint64_t> stat_errors;        // MG_EV_ERROR events raised, total
+    std::atomic<uint64_t> stat_bytes_read;    // bytes received off the wire, total
+    std::atomic<uint64_t> stat_bytes_written; // bytes written to the wire, total
     bool use_dns6;
     unsigned long nextid;
     void* userdata;
@@ -150,6 +165,7 @@ struct Connection {
     unsigned long id;
     uint64_t last_active;   // millis() of last I/O; used for idle timeout
     uint64_t recv_deadline; // deadline to complete a buffered request; 0 = none
+    uint64_t connect_deadline; // deadline to finish connecting (client); 0 = none
     struct IOBuffer recv;
     struct IOBuffer send;
     struct IOBuffer prof;
@@ -222,7 +238,9 @@ MG_SOCKET_TYPE detach_fd(struct Connection* c);
                                      EventHandler fn, void* fn_data,
                                      EventHandler pfn, void* pfn_data);
 void connect_resolved(struct Connection*);
-struct Connection* wrapfd(struct Mgr* mgr, int fd,
+// fd is MG_SOCKET_TYPE (not int) so a full-width Windows SOCKET handle is not
+// truncated on the way in; it is stored verbatim in Connection::fd.
+struct Connection* wrapfd(struct Mgr* mgr, MG_SOCKET_TYPE fd,
                                 EventHandler fn, void* fn_data);
 long io_recv(struct Connection* c, void* buf, size_t len);
 long io_send(struct Connection* c, const void* buf, size_t len);
@@ -267,6 +285,18 @@ private:
 
 // Legacy handler with int event code (for backward compatibility)
 using RawHandlerFn = std::function<void(Connection&, int, void*)>;
+
+// Snapshot of a manager's cumulative counters, for lightweight observability
+// (health/metrics endpoints, logging). Counts are monotonic over the manager
+// lifetime; `active` is an instantaneous gauge.
+struct Metrics {
+    uint64_t accepted;      // accepted connections, total
+    uint64_t closed;        // accepted connections closed, total
+    uint64_t errors;        // MG_EV_ERROR events raised, total
+    uint64_t bytes_read;    // bytes received off the wire, total
+    uint64_t bytes_written; // bytes written to the wire, total
+    int active;             // currently live accepted connections
+};
 
 // RAII wrapper around Mgr. Calls mgr_init on construction,
 // mgr_free on destruction. Non-copyable, non-movable (connections
@@ -327,6 +357,13 @@ public:
     void set_request_timeout(int ms) { mgr_.request_timeout_ms = ms; }
     int request_timeout() const { return mgr_.request_timeout_ms; }
 
+    // Connect deadline (ms) for client-initiated connections; 0 disables it.
+    // Defaults to MG_DEFAULT_CONNECT_TIMEOUT_MS. A client connection that has
+    // not finished resolving + connecting within this window is closed, which
+    // bounds a hung outbound connect() to an unreachable or black-holed peer.
+    void set_connect_timeout(int ms) { mgr_.connect_timeout_ms = ms; }
+    int connect_timeout() const { return mgr_.connect_timeout_ms; }
+
     // Maximum request body size in bytes for accepted connections; 0 disables
     // it (the default). A request advertising a larger Content-Length is
     // rejected with 413 before its body is buffered; a chunked body exceeding
@@ -341,6 +378,18 @@ public:
     int max_connections() const { return mgr_.max_connections; }
     // Current number of live accepted connections.
     int num_connections() const { return mgr_.num_accepted; }
+
+    // Snapshot the cumulative observability counters (see struct Metrics).
+    // Cheap; safe to call from a handler or between polls on the loop thread.
+    struct Metrics metrics() const {
+        using std::memory_order_relaxed;
+        return Metrics{mgr_.stat_accepted.load(memory_order_relaxed),
+                       mgr_.stat_closed.load(memory_order_relaxed),
+                       mgr_.stat_errors.load(memory_order_relaxed),
+                       mgr_.stat_bytes_read.load(memory_order_relaxed),
+                       mgr_.stat_bytes_written.load(memory_order_relaxed),
+                       mgr_.num_accepted};
+    }
 
     // Send-buffer high-water mark in bytes for accepted connections; 0 disables
     // it (the default). A connection whose unsent outbound backlog exceeds this
@@ -435,6 +484,24 @@ public:
     }
 
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }
+
+    // Aggregate observability counters summed across all workers. The per-worker
+    // counters are atomic, so this is race-free to call while run() is active.
+    // `active` reflects the acceptor's live-connection gauge (num_connections()),
+    // which is authoritative across the hand-off boundary.
+    struct Metrics metrics() const {
+        struct Metrics total{};
+        for (auto& w : workers_) {
+            struct Metrics m = w->metrics();
+            total.accepted += m.accepted;
+            total.closed += m.closed;
+            total.errors += m.errors;
+            total.bytes_read += m.bytes_read;
+            total.bytes_written += m.bytes_written;
+        }
+        total.active = num_connections();
+        return total;
+    }
 
 private:
     // Wake the acceptor and worker loops if their pipes are initialized.

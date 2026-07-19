@@ -30,6 +30,12 @@ struct HttpMessage {
     std::pair<std::string, std::string> credentials() const;
 };
 
+// http_parse() return sentinel: the request carried more than
+// MG_MAX_HTTP_HEADERS headers. Distinct from the generic parse-error (-1) so
+// the caller can answer 431 (Request Header Fields Too Large) instead of
+// silently truncating security-relevant headers.
+constexpr int MG_HTTP_TOO_MANY_HEADERS = -2;
+
 [[nodiscard]] int http_parse(const char* s, size_t len, struct HttpMessage*);
 [[nodiscard]] int http_get_request_len(const unsigned char* buf, size_t buf_len);
 void http_printf_chunk(struct Connection* cnn, const char* fmt, ...);

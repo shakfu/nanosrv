@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-19
+
+### Added
+
+- Client connect timeout (`set_connect_timeout(ms)`) on `Manager` and the Python bindings, bounding a hung outbound `connect()` to an unreachable or black-holed peer; a client connection that has not finished resolving and connecting within the window is closed. Defaults to 30 s (`MG_DEFAULT_CONNECT_TIMEOUT_MS`); 0 disables. This complements the existing accepted-connection timeouts, which did not cover client-initiated connections
+
+- Observability counters: `Manager.metrics` and `ShardedManager.metrics` expose a `Metrics` snapshot of cumulative counts (accepted, closed, `MG_EV_ERROR` events, bytes read/written) plus a live accepted-connection gauge. The counters are atomic so `ShardedManager` can aggregate them across worker threads race-free while `run()` is active (verified under ThreadSanitizer). Covered by C++ and Python tests
+
+- Compile-time log floor `MG_LOG_LEVEL_MAX`: log sites above the floor are dead-coded (their argument evaluation and string literals dropped), which is stronger than the runtime level gate because a compiled-out site cannot be re-enabled by `mg_log_set()`. Defaults to keeping Debug/Verbose in debug builds and compiling them out in release (`NDEBUG`); overridable on the command line
+
+- `static_assert`s over the `platform.hpp` config matrix: a valid `MG_ARCH`, mutual exclusion of the readiness backends (`MG_ENABLE_EPOLL`/`KQUEUE`/`POLL`/`IO_URING`), no POSIX poller under the Win32 arch, and an enabled socket backend now fail at compile time instead of late and obscurely. The poller selectors are also normalized to explicit 0/1
+
+- `SECURITY.md` documenting the threat-model posture ("not yet hardened for hostile networks"), the connection-hardening knobs, private vulnerability reporting, and the callback object-lifetime contract
+
+- Targeted C++ tests beyond the fuzz harness: an end-to-end WebSocket upgrade/echo across all payload-length encodings (0-byte, 7-bit, 16-bit, 64-bit) with masking and ping/pong; a raw-socket test proving an unmasked client frame is rejected; end-to-end chunked-request decoding; multipart parsing; the HTTP header-count limit; pathological float formatting (inf/-inf/nan); and large-input `match`/`span`. Plus a client connect-timeout test and metrics tests (C++ and Python)
+
 ### Changed
+
+- Default runtime log level is now `MG_LL_INFO` (was `MG_LL_DEBUG`), so the per-connection Debug/Verbose chatter is off by default; raise it with `mg_log_set(MG_LL_DEBUG)` when diagnosing (subject to the new compile-time floor)
+
+- `wrapfd()` now takes a `MG_SOCKET_TYPE` instead of an `int`, so a full-width Windows `SOCKET` handle is stored verbatim rather than truncated; the hand-off and wakeup-pipe call sites drop their `int` casts, and `sharded.cpp` closes an un-adopted FD with `closesocket()`
+
+- `-Wconversion`, `-Wsign-conversion`, and `-Wshadow` are now enabled on the `nanosrv` target (non-MSVC); the code's pervasive explicit casts left it clean apart from two benign shadows, since renamed
+
+- The CI Python matrix (`ci-py.yml`) now tests 3.10 and 3.12, aligned with `requires-python >=3.10` (previously tested 3.9)
+
+- README documents the callback object-lifetime contract (Connection/HttpMessage/WsMessage are borrowed views valid only during the call) and lists the new connect-timeout knob and metrics surface
 
 - The GitHub release body for a tag is now extracted from this changelog's matching version section (`scripts/release_notes.py`), falling back to GitHub's auto-generated commit notes when no section is found
 
@@ -20,6 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ShardedManager::drain(timeout_ms)` could overshoot its deadline by many seconds when a connection with a stalled reader kept a worker busy flushing: the deadline was only checked on the acceptor thread, which the spinning workers could starve. It is now also enforced inside each worker loop, so `drain()` returns within roughly the timeout regardless of worker load
 
 - The C++ core now compiles under MSVC and on the manylinux C++23 toolchain, so prebuilt Python wheels are produced for Linux, macOS, and Windows. The static library is built position-independent so it links into the `_core` extension module; the Linux wheel uses the `manylinux_2_28` image (GCC >= 12 supports the `-std=c++23` the core requires; the default `manylinux2014` ships GCC 10); the macOS wheel targets `MACOSX_DEPLOYMENT_TARGET=10.14` so nanobind's aligned `new`/`delete` links; and the MSVC build no longer trips over GCC/Clang-only warning flags, POSIX `ssize_t`, `rand_s` used without `_CRT_RAND_S`, or a constrained-template definition spelled differently from its declaration
+
+- The epoll and kqueue readiness arrays were `alloca`'d and sized to the connection count, so a very large connection count meant a very large stack frame. They now harvest into a fixed-size batch (`MG_IO_POLL_BATCH` = 256 events) on the stack -- both backends are level-triggered, so any ready fds beyond the batch return on the next poll -- and the `poll()` fallback, which needs one entry per fd in a single call, spills to a heap buffer past the batch size. Stack use is now constant
+
+- Socket-FD handle truncation on Windows: `wrapfd()` took an `int`, so a 64-bit Windows `SOCKET` handed to it (the sharded hand-off and the wakeup pipe) was truncated. The handle is now carried at `MG_SOCKET_TYPE` width and stored verbatim
+
+### Security
+
+- WebSocket RFC 6455 enforcement: the frame processor accepted non-conforming peers. The server now rejects unmasked client-to-server frames (5.1) and control frames that are fragmented or carry more than 125 bytes (5.5), closing the connection with status 1002 instead of dispatching the frame
+
+- HTTP header-count overflow no longer silently truncates: a request with more than `MG_MAX_HTTP_HEADERS` (30) headers previously had the extras dropped, which could discard a security-relevant header (a second `Content-Length`, an `Authorization`). `http_parse` now returns a distinct sentinel and the request is rejected with 431 rather than parsed with a truncated header set
+
+- DNS transaction-ID de-duplication was a stub that set a new query's txnid to `previous + 1`, making ids collide under concurrent lookups and more guessable than the random path implied. New queries now pick a random txnid and rescan the outstanding-request list on every collision, so concurrent lookups never share an id
 
 ## [0.1.1]
 

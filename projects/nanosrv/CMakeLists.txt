@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(nanosrv VERSION 0.1.1 LANGUAGES CXX)
+project(nanosrv VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,7 +54,11 @@ target_include_directories(nanosrv
 if(MSVC)
     target_compile_options(nanosrv PRIVATE /W4)
 else()
-    target_compile_options(nanosrv PRIVATE -Wall -Wextra -O2)
+    # -Wconversion/-Wsign-conversion/-Wshadow are enabled to catch truncation
+    # and shadowing in the pointer/size-arithmetic-heavy core. The code casts
+    # conversions explicitly, so these are clean; keep them clean when editing.
+    target_compile_options(nanosrv PRIVATE -Wall -Wextra -O2
+        -Wconversion -Wsign-conversion -Wshadow)
 endif()
 
 # ---------------------------------------------------------------------------

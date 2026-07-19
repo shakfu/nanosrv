@@ -13,7 +13,11 @@ nanosrv is a lightweight, single-file C++ server library (based on [Mongoose](ht
 - **JSON** path-based extraction (string, number, integer, boolean)
 - **Configurable logging** levels
 - **Connection hardening**: idle timeout (`set_idle_timeout`), request-receive deadline
-  (`set_request_timeout`), and request-body cap with 413 (`set_max_body_size`)
+  (`set_request_timeout`), client connect timeout (`set_connect_timeout`), request-body
+  cap with 413 (`set_max_body_size`), max-connection cap (`set_max_connections`), and
+  send-buffer watermark (`set_max_send_buffer`)
+- **Observability**: cumulative counters and a live connection gauge (`Manager.metrics`,
+  `ShardedManager.metrics`)
 - GIL-releasing `poll()` and `run()` for responsive Python integration
 
 ## Server Implementations
@@ -151,7 +155,22 @@ nanosrv.json.boolean('{"ok": true}', "$.ok")          # True
 | `ConnectionRef` | Non-owning handle returned by `http_listen()`. Methods: `http_reply()`, `send_bytes()`, `close()`. |
 | `HttpMessage` | Read-only incoming HTTP message. Properties: `method`, `uri`, `query`, `body`, `status_code`. Methods: `header(name)`, `credentials()`. |
 | `WsMessage` | Read-only WebSocket frame. Properties: `data`, `flags`, `opcode`. |
+| `Metrics` | Snapshot of a manager's counters. Properties: `accepted`, `closed`, `errors`, `bytes_read`, `bytes_written`, `active`. Read via `Manager.metrics` / `ShardedManager.metrics`. |
 | `Url` | URL parse result. Static method: `Url.parse(url)`. Properties: `host`, `port`, `path`, `is_ssl`. |
+
+#### Callback object lifetime
+
+The `Connection`, `HttpMessage`, and `WsMessage` objects handed to a handler are
+**borrowed views valid only for the duration of that call**. They point into
+buffers owned by the event loop, which reuses or frees them as soon as the
+handler returns. Do not stash one and touch it later (from another thread, a
+timer, or a subsequent event) -- read what you need during the call, and copy
+out any bytes you must keep (e.g. `bytes(msg.body)` / `std::string(hm.body...)`).
+The Python bindings enforce this: a stored `Connection`/`HttpMessage` raises if
+used after the callback returns (see `tests/test_nanosrv.py`,
+`TestCallbackObjectLifetime`). The long-lived exception is `ConnectionRef`, the
+non-owning handle returned by `http_listen()`, which stays valid until its
+listener closes.
 
 ### Enums
 
@@ -193,9 +212,14 @@ nanosrv.json.boolean('{"ok": true}', "$.ok")          # True
   no listener applies an ACL on its own yet, so wire it into your handler if you
   need address filtering.
 - **Not yet hardened for hostile networks.** See the connection-hardening knobs
-  (`set_idle_timeout`, `set_request_timeout`, `set_max_body_size`,
-  `set_max_connections`, `set_max_send_buffer`) and the graceful-drain support,
-  but treat exposure to untrusted clients as experimental.
+  (`set_idle_timeout`, `set_request_timeout`, `set_connect_timeout`,
+  `set_max_body_size`, `set_max_connections`, `set_max_send_buffer`) and the
+  graceful-drain support, but treat exposure to untrusted clients as
+  experimental. See [SECURITY.md](SECURITY.md) for the current threat-model
+  posture and how to report a vulnerability.
+- **Observability.** `Manager.metrics` / `ShardedManager.metrics` expose
+  cumulative counters (accepted, closed, errors, bytes read/written) plus a live
+  connection gauge for health/metrics endpoints.
 
 ### Performance
 

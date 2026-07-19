@@ -1,5 +1,7 @@
 #include "nanosrv/nanosrv.hpp"
 
+#include <bit>
+
 namespace nanosrv {
 
 // ---- module: fmt ----
@@ -25,26 +27,19 @@ static int addexp(char* buf, int e, int sign)
 
 static int xisinf(double x)
 {
-    union {
-        double f;
-        uint64_t u;
-    } ieee754;
-
-    ieee754.f = x;
-    return (static_cast<unsigned>(ieee754.u >> 32) & 0x7fffffff) == 0x7ff00000
-        && (static_cast<unsigned>(ieee754.u) == 0);
+    // std::bit_cast reinterprets the IEEE-754 bits without the union
+    // type-punning that is technically UB in standard C++ (well-defined only
+    // as a GCC/Clang extension).
+    uint64_t u = std::bit_cast<uint64_t>(x);
+    return (static_cast<unsigned>(u >> 32) & 0x7fffffff) == 0x7ff00000
+        && (static_cast<unsigned>(u) == 0);
 }
 
 static int xisnan(double x)
 {
-    union {
-        double f;
-        uint64_t u;
-    } ieee754;
-
-    ieee754.f = x;
-    return (static_cast<unsigned>(ieee754.u >> 32) & 0x7fffffff)
-        + (static_cast<unsigned>(ieee754.u) != 0)
+    uint64_t u = std::bit_cast<uint64_t>(x);
+    return (static_cast<unsigned>(u >> 32) & 0x7fffffff)
+        + (static_cast<unsigned>(u) != 0)
         > 0x7ff00000;
 }
 

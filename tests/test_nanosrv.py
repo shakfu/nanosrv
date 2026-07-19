@@ -341,6 +341,46 @@ class TestHttpServer:
             stop.set()
             t.join(timeout=2)
 
+    def test_metrics_move_on_request(self):
+        mgr = nanosrv.Manager()
+
+        # Baseline: everything zero before any traffic.
+        base = mgr.metrics
+        assert base.accepted == 0
+        assert base.closed == 0
+        assert base.bytes_read == 0
+        assert base.bytes_written == 0
+        assert base.active == 0
+
+        def handler(conn, msg):
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://0.0.0.0:18324", handler)
+
+        stop = threading.Event()
+
+        def poll_loop():
+            while not stop.is_set():
+                mgr.poll(10)
+
+        t = threading.Thread(target=poll_loop, daemon=True)
+        t.start()
+
+        try:
+            time.sleep(0.05)
+            resp = urllib.request.urlopen("http://127.0.0.1:18324/hello")
+            resp.read()
+            # Give the loop a moment to observe the accept and the close.
+            time.sleep(0.1)
+            m = mgr.metrics
+            assert m.accepted >= 1
+            assert m.bytes_read > 0
+            assert m.bytes_written > 0
+            assert repr(m).startswith("Metrics(")
+        finally:
+            stop.set()
+            t.join(timeout=2)
+
 
 # ---------------------------------------------------------------------------
 # Connection properties test

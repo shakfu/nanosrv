@@ -325,6 +325,38 @@ NB_MODULE(_core, m) {
              "status"_a, "headers"_a = "", "body"_a = "");
 
     // -----------------------------------------------------------------------
+    // Metrics snapshot (observability)
+    // -----------------------------------------------------------------------
+    nb::class_<nanosrv::Metrics>(m, "Metrics",
+        "Snapshot of a manager's cumulative observability counters.")
+        .def_prop_ro("accepted",
+                     [](const nanosrv::Metrics& s) { return s.accepted; },
+                     "Accepted connections, total.")
+        .def_prop_ro("closed",
+                     [](const nanosrv::Metrics& s) { return s.closed; },
+                     "Accepted connections closed, total.")
+        .def_prop_ro("errors",
+                     [](const nanosrv::Metrics& s) { return s.errors; },
+                     "MG_EV_ERROR events raised, total.")
+        .def_prop_ro("bytes_read",
+                     [](const nanosrv::Metrics& s) { return s.bytes_read; },
+                     "Bytes received off the wire, total.")
+        .def_prop_ro("bytes_written",
+                     [](const nanosrv::Metrics& s) { return s.bytes_written; },
+                     "Bytes written to the wire, total.")
+        .def_prop_ro("active",
+                     [](const nanosrv::Metrics& s) { return s.active; },
+                     "Currently live accepted connections.")
+        .def("__repr__", [](const nanosrv::Metrics& s) {
+            return std::string("Metrics(accepted=") + std::to_string(s.accepted)
+                + ", closed=" + std::to_string(s.closed)
+                + ", errors=" + std::to_string(s.errors)
+                + ", bytes_read=" + std::to_string(s.bytes_read)
+                + ", bytes_written=" + std::to_string(s.bytes_written)
+                + ", active=" + std::to_string(s.active) + ")";
+        });
+
+    // -----------------------------------------------------------------------
     // Manager (single-threaded event loop)
     // -----------------------------------------------------------------------
     using HttpHandler = nanosrv::Manager::HttpHandler;
@@ -413,6 +445,12 @@ NB_MODULE(_core, m) {
              "completing it within `ms` milliseconds (slow-dribble defense). "
              "0 disables (the default). Set generously for large uploads.")
         .def_prop_ro("request_timeout", &nanosrv::Manager::request_timeout)
+        .def("set_connect_timeout", &nanosrv::Manager::set_connect_timeout,
+             "ms"_a,
+             "Close client-initiated connections that do not finish resolving "
+             "and connecting within `ms` milliseconds (bounds a hung outbound "
+             "connect). Defaults to 30000; 0 disables.")
+        .def_prop_ro("connect_timeout", &nanosrv::Manager::connect_timeout)
         .def("set_max_body_size", &nanosrv::Manager::set_max_body_size,
              "bytes"_a,
              "Reject request bodies larger than `bytes` with HTTP 413. An "
@@ -427,6 +465,8 @@ NB_MODULE(_core, m) {
         .def_prop_ro("max_connections", &nanosrv::Manager::max_connections)
         .def_prop_ro("num_connections", &nanosrv::Manager::num_connections,
              "Current number of live accepted connections.")
+        .def_prop_ro("metrics", &nanosrv::Manager::metrics,
+             "Snapshot of cumulative observability counters (see Metrics).")
         .def("set_max_send_buffer", &nanosrv::Manager::set_max_send_buffer,
              "bytes"_a,
              "Close an accepted connection whose unsent outbound backlog "
@@ -499,6 +539,9 @@ NB_MODULE(_core, m) {
         .def_prop_ro("num_connections",
              &nanosrv::ShardedManager::num_connections,
              "Current number of live connections across all workers.")
+        .def_prop_ro("metrics", &nanosrv::ShardedManager::metrics,
+             "Observability counters aggregated across all workers (see "
+             "Metrics). Race-free to read while run() is active.")
         .def("set_max_send_buffer",
              &nanosrv::ShardedManager::set_max_send_buffer, "bytes"_a,
              "Send-buffer high-water mark (bytes) on every worker; a connection "

@@ -191,9 +191,13 @@ bool str_to_num(struct Str str, int base, void* val, size_t val_len)
     case 16:
         while (i < str.len) {
             char c = str.buf[i];
+            // Map a hex character to its value. The explicit "- 'A' + 10" form
+            // is used instead of the terse "- '7'" (and "- 'a' + 10" for "- 'W'")
+            // so the intent is obvious and a future edit cannot silently break
+            // the magic offset.
             uint64_t digit = (c >= '0' && c <= '9') ? static_cast<uint64_t>(c - '0')
-                : (c >= 'A' && c <= 'F')            ? static_cast<uint64_t>(c - '7')
-                : (c >= 'a' && c <= 'f')            ? static_cast<uint64_t>(c - 'W')
+                : (c >= 'A' && c <= 'F')            ? static_cast<uint64_t>(c - 'A' + 10)
+                : (c >= 'a' && c <= 'f')            ? static_cast<uint64_t>(c - 'a' + 10)
                                                     : static_cast<uint64_t>(~0);
             if (digit == static_cast<uint64_t>(~0))
                 break;

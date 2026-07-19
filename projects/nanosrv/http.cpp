@@ -277,7 +277,8 @@ static const char* skiptorn(const char* s, const char* end, struct Str* v)
 }
 
 static bool http_parse_headers(const char* s, const char* end,
-                                  struct HttpHeader* h, size_t max_hdrs)
+                                  struct HttpHeader* h, size_t max_hdrs,
+                                  bool* overflow)
 {
     size_t i, n;
     int cl_count = 0, te_count = 0, auth_count = 0;
@@ -321,6 +322,16 @@ static bool http_parse_headers(const char* s, const char* end,
         // MG_INFO(("--HH [%.*s] [%.*s]", (int) k.len, k.buf, (int) v.len,
         // v.buf));
         h[i].name = k, h[i].value = v; // Success. Assign values
+    }
+    // All header slots are filled. If the next line is not the blank-line
+    // terminator, the request carries more headers than we can store. Signal
+    // overflow instead of silently dropping them (a dropped header could be a
+    // second Content-Length or an Authorization).
+    if (i == max_hdrs && s < end
+        && !(s[0] == '\n' || (s[0] == '\r' && s[1] == '\n'))) {
+        if (overflow != NULL)
+            *overflow = true;
+        return false;
     }
     return true;
 }
@@ -383,9 +394,12 @@ int http_parse(const char* s, size_t len, struct HttpMessage* hm)
     if (hm->method.len == 0 || hm->uri.len == 0)
         return -1;
 
+    bool hdr_overflow = false;
     if (!http_parse_headers(s, end, hm->headers,
-                               sizeof(hm->headers) / sizeof(hm->headers[0])))
-        return -1; // error when parsing
+                               sizeof(hm->headers) / sizeof(hm->headers[0]),
+                               &hdr_overflow)) {
+        return hdr_overflow ? MG_HTTP_TOO_MANY_HEADERS : -1;
+    }
     if ((cl = http_get_header(hm, "Content-Length")) != NULL) {
         if (to_size_t(*cl, &hm->body.len) == false)
             return -1;
@@ -591,6 +605,18 @@ void http_cb(struct Connection* c, int ev, void* ev_data)
             struct Str* te; // Transfer - encoding header
             bool is_chunked = false, is_http_1_0 = false;
             size_t old_len = c->recv.len;
+            if (n == MG_HTTP_TOO_MANY_HEADERS) {
+                // Too many headers to store. Answer 431 rather than proceed
+                // with a silently truncated header set. Discard and drain like
+                // the 413 (oversized body) path so the request is not
+                // re-delivered as a message on close.
+                if (!c->is_client)
+                    http_reply(c, 431, "", "");
+                MG_ERROR(("HTTP too many headers, %lu bytes", c->recv.len));
+                c->recv.len = 0;
+                c->is_draining = 1;
+                return;
+            }
             if (n < 0) {
                 // We don't use error() here, to avoid closing pipelined
                 // requests prematurely, see #2592

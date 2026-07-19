@@ -6,6 +6,7 @@ namespace nanosrv {
 
 struct ws_msg {
     uint8_t flags;
+    bool masked;
     size_t header_len;
     size_t data_len;
 };
@@ -72,6 +73,7 @@ static size_t ws_process(uint8_t* buf, size_t len, struct ws_msg* msg)
         n = buf[1] & MG_WS_PAYLOAD_LEN_MASK;
         mask_len = buf[1] & MG_WS_MASK_BIT ? MG_WS_MASK_LEN : 0;
         msg->flags = buf[0];
+        msg->masked = mask_len > 0;
         if (n < MG_WS_EXTENDED_PAYLOAD_16 && len >= mask_len) {
             msg->data_len = n;
             msg->header_len = MG_WS_MIN_HEADER_SIZE + mask_len;
@@ -148,6 +150,18 @@ size_t ws_send(struct Connection* c, const void* buf, size_t len, int op)
     return header_len + len;
 }
 
+// Send a Close frame carrying a 2-byte big-endian status code (RFC 6455 5.5.1)
+// and put the connection into draining state. Used to reject protocol
+// violations with 1002 (protocol error).
+static void ws_close_with_code(struct Connection* c, uint16_t code)
+{
+    uint8_t payload[2];
+    payload[0] = static_cast<uint8_t>(code >> 8);
+    payload[1] = static_cast<uint8_t>(code & 0xff);
+    ws_send(c, payload, sizeof(payload), WEBSOCKET_OP_CLOSE);
+    c->is_draining = 1;
+}
+
 static bool ws_client_handshake(struct Connection* c)
 {
     int n = http_get_request_len(c->recv.buf, c->recv.len);
@@ -190,6 +204,27 @@ static void ws_cb(struct Connection* c, int ev, void* ev_data)
             len = msg.header_len + msg.data_len;
             final = msg.flags & 128;
             op = msg.flags & 15;
+
+            // RFC 6455 conformance. A server MUST close with 1002 on a
+            // protocol error. Enforce before dispatching so a non-conforming
+            // peer never reaches a handler.
+            //
+            // 5.1: all client->server frames MUST be masked. Only enforce for
+            // the server role; a client receiving a masked server frame is a
+            // separate (unasked) check that would break existing echo tests.
+            //
+            // 5.5: control frames (0x8-0xA) MUST NOT be fragmented (FIN=1) and
+            // MUST carry a payload of <=125 bytes.
+            if (!c->is_client && !msg.masked) {
+                MG_DEBUG(("%lu WS unmasked client frame", c->id));
+                ws_close_with_code(c, 1002);
+                break;
+            }
+            if (op >= WEBSOCKET_OP_CLOSE && (final == 0 || msg.data_len > 125)) {
+                MG_DEBUG(("%lu WS bad control frame", c->id));
+                ws_close_with_code(c, 1002);
+                break;
+            }
             switch (op) {
             case WEBSOCKET_OP_CONTINUE:
                 call(c, MG_EV_WS_CTL, &m);

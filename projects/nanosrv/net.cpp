@@ -191,8 +191,14 @@ void close_conn(struct Connection* c)
 {
     resolve_cancel(c); // Close any pending DNS query
     // Maintain the live accepted-connection count for the max_connections cap.
-    if (c->is_accepted && c->mgr->num_accepted > 0)
-        c->mgr->num_accepted--;
+    if (c->is_accepted) {
+        // num_accepted is the single-Manager live gauge; sharded workers track
+        // liveness via live_conns_ and leave it at 0. Guard the decrement on it,
+        // but count the close for metrics regardless so both paths are covered.
+        if (c->mgr->num_accepted > 0)
+            c->mgr->num_accepted--;
+        c->mgr->stat_closed.fetch_add(1, std::memory_order_relaxed);  // metrics
+    }
     LIST_DELETE(struct Connection, &c->mgr->conns, c);
     if (c == c->mgr->dns4.c)
         c->mgr->dns4.c = NULL;
@@ -283,7 +289,7 @@ struct Connection* listen_(struct Mgr* mgr, const char* url,
     return c;
 }
 
-struct Connection* wrapfd(struct Mgr* mgr, int fd,
+struct Connection* wrapfd(struct Mgr* mgr, MG_SOCKET_TYPE fd,
                                 EventHandler fn, void* fn_data)
 {
     struct Connection* c = alloc_conn(mgr);
@@ -334,9 +340,9 @@ void mgr_free(struct Mgr* mgr)
     MG_DEBUG(("All connections closed"));
     // Drain connection pool
     while (mgr->conn_pool != nullptr) {
-        auto* c = static_cast<Connection*>(mgr->conn_pool);
-        mgr->conn_pool = c->next;
-        ::operator delete(c);
+        auto* pooled = static_cast<Connection*>(mgr->conn_pool);
+        mgr->conn_pool = pooled->next;
+        ::operator delete(pooled);
     }
     mgr->conn_pool_size = 0;
 #if MG_ENABLE_IO_URING
@@ -385,6 +391,7 @@ void mgr_init(struct Mgr* mgr)
 #endif
     mgr->pipe = MG_INVALID_SOCKET;
     mgr->dnstimeout = MG_DEFAULT_DNS_TIMEOUT_MS;
+    mgr->connect_timeout_ms = MG_DEFAULT_CONNECT_TIMEOUT_MS;
     mgr->dns4.url = MG_DEFAULT_DNS4_URL;
     mgr->dns6.url = MG_DEFAULT_DNS6_URL;
     tls_ctx_init(mgr);
@@ -399,9 +406,9 @@ void mgr_init(struct Mgr* mgr)
 
 // -- Modern C++ API: Connection methods --
 
-bool Connection::send_bytes(std::string_view data)
+bool Connection::send_bytes(std::string_view bytes)
 {
-    return send_data(this, data.data(), data.size());
+    return send_data(this, bytes.data(), bytes.size());
 }
 
 size_t Connection::write_fmt(const char* fmt, ...)

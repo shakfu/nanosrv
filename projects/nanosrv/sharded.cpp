@@ -4,6 +4,13 @@
 #include <thread>
 #include <vector>
 
+// Portable socket close: platform.hpp defines closesocket() on Windows; on
+// POSIX it maps to close(). Mirrors the fallback in sock.cpp so this TU can
+// close an un-adopted FD without truncating a Windows SOCKET handle to int.
+#ifndef closesocket
+#define closesocket(x) close(x)
+#endif
+
 namespace nanosrv {
 
 using HttpHandler = Manager::HttpHandler;
@@ -58,7 +65,7 @@ static void drain_worker(Mgr* mgr, WorkerQueue* q, const HttpHandler& handler,
         }
 
         auto* ctx = new AdoptCtx{handler, live};
-        auto* c = wrapfd(mgr, static_cast<int>(pc.fd),
+        auto* c = wrapfd(mgr, pc.fd,
             [](Connection* c, int ev, void* ev_data) {
                 auto* ctx = static_cast<AdoptCtx*>(c->fn_data);
                 if (ev == MG_EV_HTTP_MSG)
@@ -75,6 +82,10 @@ static void drain_worker(Mgr* mgr, WorkerQueue* q, const HttpHandler& handler,
             c->rem = pc.rem;
             c->loc = pc.loc;
             c->is_accepted = 1;
+            // Count the hand-off as an accept for metrics. Workers do not run
+            // accept_conn (the acceptor does), so this is the sharded-path
+            // counterpart to the stat_accepted bump there.
+            mgr->stat_accepted.fetch_add(1, std::memory_order_relaxed);
             c->pfn = http_cb;
         } else {
             // Adoption failed: drop the FD and release the slot we reserved at
@@ -82,7 +93,7 @@ static void drain_worker(Mgr* mgr, WorkerQueue* q, const HttpHandler& handler,
             if (live)
                 live->fetch_sub(1, std::memory_order_relaxed);
             delete ctx;
-            close(static_cast<int>(pc.fd));
+            closesocket(pc.fd);  // portable + no handle truncation on Windows
         }
     }
 }

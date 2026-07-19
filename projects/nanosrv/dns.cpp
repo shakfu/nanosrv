@@ -295,10 +295,23 @@ static void sendnsreq(struct Connection* c, struct Str* name, int ms,
     } else {
         struct dns_data* reqs = static_cast<struct dns_data*>(c->mgr->active_dns_requests);
         uint16_t id;
-        random_(&id, sizeof(uint16_t));
-        // TODO(): traverse reqs and check id != reqs->txnid; repeat otherwise
-        if (reqs != NULL)
-            id = static_cast<uint16_t>(reqs->txnid + 1); // no collision
+        // Pick a random txnid that does not collide with any in-flight
+        // request. Rescan the whole outstanding list on every collision so
+        // that concurrent lookups never share an id (a collision would let a
+        // response for one query satisfy another). 65536 attempts bounds the
+        // loop even if the list were pathologically full.
+        for (unsigned attempt = 0; attempt < 0x10000; attempt++) {
+            random_(&id, sizeof(uint16_t));
+            bool taken = false;
+            for (struct dns_data* r = reqs; r != NULL; r = r->next) {
+                if (r->txnid == id) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken)
+                break;
+        }
         d->txnid = id;
         d->next = reqs;
         c->mgr->active_dns_requests = d;

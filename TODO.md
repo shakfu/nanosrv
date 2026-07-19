@@ -39,23 +39,22 @@ nice-to-have.
   listen returns a null/invalid listener; `http://` still works). This is the
   C++-side counterpart of the Python `tls_available()` guard above.
 
-- [ ] **DNS transaction-ID de-duplication is a stub** (`projects/nanosrv/dns.cpp:~299`).
-  When prior requests exist the new txnid is set to `reqs->txnid + 1` instead of
-  scanning for a free id, so concurrent lookups can collide and ids are more
-  guessable than the random path implies. Implement "scan existing reqs, repeat
-  on collision".
+- [x] **DNS transaction-ID de-duplication is a stub** (`projects/nanosrv/dns.cpp`).
+  `sendnsreq` now picks a random txnid and rescans the whole outstanding-request
+  list on every collision, so concurrent lookups never share an id (bounded at
+  65536 attempts). Replaces the old `reqs->txnid + 1` stub.
 
-- [ ] **WebSocket RFC 6455 enforcement** (`projects/nanosrv/ws.cpp`). `ws_process`
-  does not require client->server frames to be masked (5.1) nor that control
-  frames (0x8-0xA) are FIN=1 with payload <= 125 bytes (5.5). Not a memory-safety
-  issue (bounds checks hold), but non-conforming peers are accepted. Enforce the
-  rules and close with status 1002 on violation.
+- [x] **WebSocket RFC 6455 enforcement** (`projects/nanosrv/ws.cpp`). `ws_cb` now
+  rejects unmasked client->server frames (5.1) and control frames (0x8-0xA) that
+  are fragmented or carry >125 bytes (5.5), closing with status 1002 via a
+  `ws_close_with_code` helper. Covered by a C++ e2e echo test (all payload-length
+  encodings + ping/pong) and a raw-socket unmasked-frame-rejection test.
 
-- [ ] **Header-count overflow silently truncates** (`projects/nanosrv/http.cpp:285`,
-  `MG_MAX_HTTP_HEADERS` = 30). Headers past the 30th are dropped rather than
-  rejected, which can discard a security-relevant header (a second
-  `Content-Length`, an `Authorization`). Reject with 431 when the count is
-  exceeded.
+- [x] **Header-count overflow silently truncates** (`projects/nanosrv/http.cpp`,
+  `MG_MAX_HTTP_HEADERS` = 30). `http_parse_headers` now detects overflow and
+  `http_parse` returns a distinct `MG_HTTP_TOO_MANY_HEADERS` sentinel; `http_cb`
+  answers 431 instead of proceeding with a truncated header set. Covered by a
+  parser-level test.
 
 ## P2 -- Robustness & production-readiness
 
@@ -76,53 +75,70 @@ nice-to-have.
   and verified clean under TSAN and ASAN/UBSan; the TSAN run also surfaced and
   fixed a pre-existing wakeup-pipe race in `stop()`/`drain()`.
 
-- [ ] **Python version matrix mismatch** (`pyproject.toml` requires `>=3.10` but
-  `.github/workflows/ci-py.yml` still tests Python 3.9). Align the matrix with
-  `requires-python`. (`release.yml` already builds cp310+.)
+- [x] **Python version matrix mismatch** (`.github/workflows/ci-py.yml`). Matrix
+  now tests `["3.10", "3.12"]`, aligned with `requires-python >=3.10`.
 
-- [ ] **Logging defaults verbose and always compiled in** (`projects/nanosrv/log.cpp`). Default the runtime level to Info/Error and add a compile-time floor that compiles out sub-threshold `MG_DEBUG`/`MG_VERBOSE` calls.
+- [x] **Logging defaults verbose and always compiled in** (`projects/nanosrv/log.cpp`,
+  `platform.hpp`). Default runtime level is now `MG_LL_INFO`, and a compile-time
+  floor `MG_LOG_LEVEL_MAX` (Info in `NDEBUG`/release, Verbose in debug;
+  overridable) dead-codes sub-threshold `MG_DEBUG`/`MG_VERBOSE` sites so they
+  cannot be re-enabled at runtime.
 
-- [ ] **Connect timeout for client-initiated connections** (the timeout work so far covers accepted/server connections only). A hung outbound `connect()` is not
-  bounded.
+- [x] **Connect timeout for client-initiated connections.** Added
+  `connect_timeout_ms` (default `MG_DEFAULT_CONNECT_TIMEOUT_MS` = 30 s) armed in
+  the poll loop for client connections still resolving/connecting; exposed as
+  `set_connect_timeout()` in C++ and Python. Covered by a C++ test against a
+  black-holed TEST-NET address.
 
-- [ ] **Observability hooks.** No metrics/health surface (connection counts, error rates). Add lightweight counters/callbacks.
+- [x] **Observability hooks.** Added atomic cumulative counters on `Mgr`
+  (accepted/closed/errors/bytes read/written), a `Metrics` snapshot exposed via
+  `Manager::metrics()` and `ShardedManager::metrics()` (aggregated across
+  workers, TSan-clean), and the Python `Manager.metrics` / `ShardedManager.metrics`
+  properties. Covered by C++ and Python tests.
 
 ## P3 -- Quality, tests & portability
 
-- [ ] **Enable `-Wconversion` / `-Wsign-conversion` / `-Wshadow`** and triage. The code is pointer- and size-arithmetic-heavy; these flags may surface real
-  truncation bugs. Fix the genuine ones, cast the benign ones. (Low risk, high
-  signal -- a good next pick.)
+- [x] **Enable `-Wconversion` / `-Wsign-conversion` / `-Wshadow`** and triage.
+  Enabled on the `nanosrv` target (non-MSVC). The pervasive explicit casts left
+  the library clean apart from two benign shadows (`net.cpp`, since renamed).
+  Verified clean locally on the kqueue path; the Linux epoll/io_uring legs are
+  validated by CI.
 
-- [ ] **`static_assert` the `platform.hpp` config matrix** so an inconsistent
-  `MG_ARCH`/`MG_ENABLE_*` combination fails at compile time, not late and obscurely.
+- [x] **`static_assert` the `platform.hpp` config matrix.** Poller selectors are
+  normalized to 0/1, then static_asserts enforce a valid `MG_ARCH`, mutual
+  exclusion of the readiness backends, no POSIX poller under Win32, and an
+  enabled socket backend. Verified to fire on a bad combination.
 
-- [ ] **Targeted unit/e2e tests** beyond the existing fuzz harness:
+- [x] **Targeted unit/e2e tests** beyond the fuzz harness:
+  - WebSocket end-to-end upgrade/echo across all payload-length encodings
+    (0-byte, 7-bit, 16-bit, 64-bit), masking, and ping/pong; plus a raw-socket
+    unmasked-frame-rejection test.
+  - HTTP edge cases: chunked-request decoding (e2e), multipart boundaries,
+    header-limit -> 431 handling.
+  - Formatter/string layer: pathological floats (inf/-inf/nan) and large-input
+    `match`/`span`.
 
-  - WebSocket framing (0-byte payload, 16-bit and 64-bit extended length, masking, control frames) and an end-to-end upgrade/send/receive test.
+- [x] **Per-poll cap on `alloca` event arrays** (`projects/nanosrv/sock.cpp`).
+  epoll/kqueue now harvest into a fixed-size `MG_IO_POLL_BATCH` (256) stack array
+  (level-triggered, so remaining events return next poll); the poll() path falls
+  back to a heap buffer past that size. Bounds stack use to a constant.
 
-  - HTTP edge cases: chunked decoding, multipart boundaries, header-limit handling, 4xx/5xx paths.
-
-  - Custom formatter/string layer (`fmt`/`dtoa`/`str`): pathological floats,
-    large-input `match`/`span`.
-
-- [ ] **Per-poll cap on `alloca` event arrays** (`projects/nanosrv/sock.cpp`,
-  epoll/kqueue/poll paths). Sizing scales with connection count; chunk it to bound stack use under very high connection counts.
-
-- [ ] **Socket-FD `int` casts assume POSIX** (`wrapfd(..., static_cast<int>(fd))`). False for Windows `SOCKET`; only relevant if Windows support is intended (CI
-  builds Windows wheels, so the C++ core's Windows portability is nominally in
-  scope but untested at the C++ level).
+- [x] **Socket-FD `int` casts assume POSIX.** `wrapfd` now takes `MG_SOCKET_TYPE`
+  instead of `int`, so a full-width Windows `SOCKET` handle is stored verbatim
+  (via `S2PTR`) rather than truncated; call sites drop the `int` casts and
+  `sharded.cpp` uses `closesocket()` for un-adopted FDs.
 
 ## P4 -- Cosmetic / nice-to-have
 
-- [ ] **Use `std::bit_cast` (or `std::isinf`/`std::isnan`)** instead of `union`
-  type-punning in the float formatter (`projects/nanosrv/fmt.cpp`,
-  `xisinf`/`xisnan`) for strict conformance.
+- [x] **Use `std::bit_cast`** instead of `union` type-punning in the float
+  formatter (`projects/nanosrv/fmt.cpp`, `xisinf`/`xisnan`).
 
-- [ ] **Clarify cryptic hex offsets** (`projects/nanosrv/str.cpp`, `c - '7'` /
-  `c - 'W'`); the explicit `c - 'A' + 10` form prevents a future edit error.
+- [x] **Clarify cryptic hex offsets** (`projects/nanosrv/str.cpp`): `c - '7'` /
+  `c - 'W'` are now the explicit `c - 'A' + 10` / `c - 'a' + 10` form.
 
-- [ ] **Docs**: add a `SECURITY.md` and an explicit "not for hostile networks yet" note; document the callback object-lifetime contract (handles handed to a
-  handler are valid only during the call).
+- [x] **Docs**: added `SECURITY.md` (threat-model posture, "not for hostile
+  networks yet", hardening knobs, reporting) and documented the callback
+  object-lifetime contract in both `SECURITY.md` and the README API reference.
 
 ---
 

@@ -33,6 +33,7 @@ void error(struct Connection* c, const char* fmt, ...)
     vsnprintf_(buf, sizeof(buf), fmt, &ap);
     va_end(ap);
     MG_ERROR(("%lu %ld %s", c->id, c->fd, buf));
+    c->mgr->stat_errors.fetch_add(1, std::memory_order_relaxed);  // metrics
     c->is_closing = 1;            // Set is_closing before sending MG_EV_CALL
     call(c, MG_EV_ERROR, buf); // Let user handler override it
 }

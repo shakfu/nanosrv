@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -702,6 +703,114 @@ static void test_connection_send_bytes()
     assert(sent_ok);
 }
 
+// ---- HTTP header-count limit (431 path) ----
+
+// Exactly MG_MAX_HTTP_HEADERS headers must parse; one more must be rejected with
+// the distinct too-many-headers sentinel (which http_cb answers as 431) rather
+// than being silently truncated.
+static void test_http_header_limit()
+{
+    auto build = [](int n) {
+        std::string r = "GET / HTTP/1.1\r\n";
+        for (int i = 0; i < n; i++)
+            r += "H" + std::to_string(i) + ": v\r\n";
+        r += "\r\n";
+        return r;
+    };
+    HttpMessage hm;
+    std::string ok = build(MG_MAX_HTTP_HEADERS);
+    assert(http_parse(ok.c_str(), ok.size(), &hm) > 0);
+
+    std::string over = build(MG_MAX_HTTP_HEADERS + 1);
+    assert(http_parse(over.c_str(), over.size(), &hm)
+           == MG_HTTP_TOO_MANY_HEADERS);
+}
+
+// ---- Multipart form parsing ----
+
+static void test_http_multipart()
+{
+    // Two parts: a plain field and a file part with a filename.
+    const char* body =
+        "--xyz\r\n"
+        "Content-Disposition: form-data; name=\"a\"\r\n"
+        "\r\n"
+        "AAA\r\n"
+        "--xyz\r\n"
+        "Content-Disposition: form-data; name=\"b\"; filename=\"f.txt\"\r\n"
+        "\r\n"
+        "BBBB\r\n"
+        "--xyz--\r\n";
+    Str b = str_n(body, strlen(body));
+
+    HttpPart part;
+    size_t ofs = http_next_multipart(b, 0, &part);
+    assert(ofs > 0);
+    assert(part.name.len == 1 && part.name.buf[0] == 'a');
+    assert(part.body.len == 3 && memcmp(part.body.buf, "AAA", 3) == 0);
+    assert(part.filename.len == 0);
+
+    ofs = http_next_multipart(b, ofs, &part);
+    assert(ofs > 0);
+    assert(part.name.len == 1 && part.name.buf[0] == 'b');
+    assert(part.filename.len == 5 && memcmp(part.filename.buf, "f.txt", 5) == 0);
+    assert(part.body.len == 4 && memcmp(part.body.buf, "BBBB", 4) == 0);
+
+    // No more parts.
+    assert(http_next_multipart(b, ofs, &part) == 0);
+}
+
+// ---- Float formatting (custom dtoa) ----
+
+static void test_float_formatting()
+{
+    char buf[64];
+
+    snprintf_(buf, sizeof(buf), "%g", 0.0);
+    assert(strcmp(buf, "0") == 0);
+    snprintf_(buf, sizeof(buf), "%g", 1.5);
+    assert(strcmp(buf, "1.5") == 0);
+    snprintf_(buf, sizeof(buf), "%g", -2.25);
+    assert(strcmp(buf, "-2.25") == 0);
+
+    // Pathological values must render as words, never garbage.
+    double inf = HUGE_VAL;
+    snprintf_(buf, sizeof(buf), "%g", inf);
+    assert(strcmp(buf, "inf") == 0);
+    snprintf_(buf, sizeof(buf), "%g", -inf);
+    assert(strcmp(buf, "-inf") == 0);
+    double nan = inf - inf;  // NaN
+    snprintf_(buf, sizeof(buf), "%g", nan);
+    assert(strcmp(buf, "nan") == 0);
+}
+
+// ---- str match/span ----
+
+static void test_str_match_span()
+{
+    // Glob-style matcher: '?' one char, '*' spans within a segment (not '/'),
+    // '#' spans anything including '/'.
+    assert(match(Str("abc"), Str("abc"), nullptr));
+    assert(match(Str("abc"), Str("a?c"), nullptr));
+    assert(!match(Str("abc"), Str("abx"), nullptr));
+    assert(match(Str("abcdef"), Str("a*f"), nullptr));
+    assert(!match(Str("a/b"), Str("a*b"), nullptr));  // '*' stops at '/'
+    assert(match(Str("a/b"), Str("a#b"), nullptr));   // '#' crosses '/'
+
+    // '#' capture must handle a large input without walking off the buffer.
+    std::string big(4096, 'z');
+    std::string subject = "/p/" + big;
+    Str cap;
+    assert(match(Str(subject.c_str()), Str("/p/#"), &cap));
+    assert(cap.len == big.size());
+
+    // span() splits on the first separator; the remainder keeps the tail.
+    Str head, tail;
+    assert(span(Str("key=value=extra"), &head, &tail, '='));
+    assert(head.len == 3 && memcmp(head.buf, "key", 3) == 0);
+    assert(tail.len == 11 && memcmp(tail.buf, "value=extra", 11) == 0);
+}
+
 #ifndef _WIN32
 // Minimal blocking HTTP client: connect, send a GET, return true iff the
 // response status line carries "200". Uses a recv timeout so a hung worker
@@ -771,6 +880,14 @@ static void test_sharded_concurrent_requests()
             if (http_get_200(port))
                 ok_count.fetch_add(1, std::memory_order_relaxed);
         });
+    // Read the aggregate metrics while workers are actively serving. This
+    // exercises the cross-thread counter read (worker threads mutate the atomic
+    // counters concurrently) -- it must be race-free under TSan.
+    for (int i = 0; i < 5; i++) {
+        (void)sharded.metrics();
+        std::this_thread::sleep_for(2ms);
+    }
+
     for (auto& t : clients)
         t.join();
 
@@ -779,6 +896,263 @@ static void test_sharded_concurrent_requests()
 
     assert(ok_count.load() == num_clients);
     assert(served.load() == num_clients);
+
+    // After the drain, the aggregate counters must reflect all the traffic.
+    Metrics m = sharded.metrics();
+    assert(m.accepted >= static_cast<uint64_t>(num_clients));
+    assert(m.closed >= static_cast<uint64_t>(num_clients));
+    assert(m.bytes_read > 0 && m.bytes_written > 0);
+}
+
+// ---- HTTP chunked request decoding (end-to-end) ----
+
+// A chunked request body must be de-chunked and delivered as a contiguous body
+// to the handler. Drives a raw socket to send the chunk framing verbatim.
+static void test_http_chunked_request()
+{
+    const uint16_t port = 18901;
+    Manager mgr;
+    std::string got_body;
+    bool got_msg = false;
+
+    auto ref = mgr.http_listen(
+        std::string("http://127.0.0.1:") + std::to_string(port),
+        HandlerFn([&](Connection& c, Event ev, void* ed) {
+            if (ev == Event::HttpMessage) {
+                auto* hm = static_cast<HttpMessage*>(ed);
+                got_body.assign(hm->body.buf, hm->body.len);
+                got_msg = true;
+                http_reply(&c, 200, "", "ok");
+            }
+        }));
+    assert(ref);
+
+    std::atomic<bool> stop{false};
+    std::thread poller([&mgr, &stop]() {
+        while (!stop.load())
+            mgr.poll(10ms);
+    });
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct timeval tv{};
+    tv.tv_sec = 3;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0) {
+        const char* req =
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4\r\nWiki\r\n"
+            "5\r\npedia\r\n"
+            "0\r\n\r\n";
+        (void)send(fd, req, strlen(req), 0);
+        char buf[128];
+        (void)recv(fd, buf, sizeof(buf), 0);  // wait for the reply
+    }
+    close(fd);
+
+    stop.store(true);
+    poller.join();
+
+    assert(got_msg);
+    assert(got_body == "Wikipedia");  // the two chunks, concatenated
+}
+
+// ---- WebSocket end-to-end ----
+
+// Client and server share one Manager and one event loop. The client sends
+// messages spanning all three payload-length encodings (7-bit, 16-bit and
+// 64-bit) plus a 0-byte frame and a Ping; the server echoes each TEXT frame.
+// Exercises framing (masking on the client side, unmasking on the server,
+// extended lengths, control frames) through the real send/parse path.
+struct WsEchoState {
+    int server_opens = 0;
+    int client_opens = 0;
+    int client_pongs = 0;
+    std::vector<size_t> echoed;   // sizes of TEXT echoes the client received
+    std::vector<size_t> sizes;    // sizes to send on open
+};
+
+static void ws_echo_client_ev(Connection* c, int ev, void* ed)
+{
+    auto* st = static_cast<WsEchoState*>(c->fn_data);
+    if (ev == MG_EV_WS_OPEN) {
+        st->client_opens++;
+        for (size_t sz : st->sizes) {
+            std::string payload(sz, 'x');
+            ws_send(c, payload.data(), payload.size(), WEBSOCKET_OP_TEXT);
+        }
+        ws_send(c, "hi", 2, WEBSOCKET_OP_PING);
+    } else if (ev == MG_EV_WS_MSG) {
+        auto* m = static_cast<WsMessage*>(ed);
+        st->echoed.push_back(m->data.len);
+    } else if (ev == MG_EV_WS_CTL) {
+        auto* m = static_cast<WsMessage*>(ed);
+        if ((m->flags & 15) == WEBSOCKET_OP_PONG)
+            st->client_pongs++;
+    }
+}
+
+static void test_ws_echo_e2e()
+{
+    const uint16_t port = 18898;
+    Manager mgr;
+    WsEchoState st;
+    st.sizes = {0, 5, 200, 70000};  // 7-bit, 7-bit, 16-bit, 64-bit lengths
+
+    auto ref = mgr.http_listen(
+        std::string("http://127.0.0.1:") + std::to_string(port),
+        HandlerFn([&st](Connection& c, Event ev, void* ed) {
+            if (ev == Event::HttpMessage) {
+                st.server_opens++;
+                ws_upgrade(&c, static_cast<HttpMessage*>(ed), nullptr);
+            } else if (ev == Event::WsMessage) {
+                auto* m = static_cast<WsMessage*>(ed);
+                ws_send(&c, m->data.buf, m->data.len, WEBSOCKET_OP_TEXT);
+            }
+        }));
+    assert(ref);
+
+    auto* cl = ws_connect(mgr.raw(),
+                          (std::string("ws://127.0.0.1:") + std::to_string(port))
+                              .c_str(),
+                          ws_echo_client_ev, &st, nullptr);
+    assert(cl != nullptr);
+
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < deadline
+           && (st.echoed.size() < st.sizes.size() || st.client_pongs == 0)) {
+        mgr.poll(10ms);
+    }
+
+    assert(st.client_opens == 1);
+    assert(st.echoed.size() == st.sizes.size());
+    for (size_t i = 0; i < st.sizes.size(); i++)
+        assert(st.echoed[i] == st.sizes[i]);  // each length round-tripped intact
+    assert(st.client_pongs >= 1);             // Ping was answered with a Pong
+}
+
+// ---- WebSocket RFC 6455 enforcement ----
+
+// After a valid handshake, an unmasked client->server frame violates RFC 6455
+// 5.1 and the server must close the connection (with status 1002). Drives a raw
+// socket so we can emit a deliberately non-conforming frame.
+static void test_ws_unmasked_frame_rejected()
+{
+    const uint16_t port = 18899;
+    Manager mgr;
+    auto ref = mgr.http_listen(
+        std::string("http://127.0.0.1:") + std::to_string(port),
+        HandlerFn([](Connection& c, Event ev, void* ed) {
+            if (ev == Event::HttpMessage)
+                ws_upgrade(&c, static_cast<HttpMessage*>(ed), nullptr);
+        }));
+    assert(ref);
+
+    std::atomic<bool> stop{false};
+    std::thread poller([&mgr, &stop]() {
+        while (!stop.load())
+            mgr.poll(10ms);
+    });
+
+    bool server_closed = false;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct timeval tv{};
+    tv.tv_sec = 3;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0) {
+        const char* hs =
+            "GET / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "\r\n";
+        (void)send(fd, hs, strlen(hs), 0);
+
+        // Read the 101 handshake response (terminated by a blank line).
+        char resp[512];
+        std::string acc;
+        while (acc.find("\r\n\r\n") == std::string::npos) {
+            ssize_t n = recv(fd, resp, sizeof(resp), 0);
+            if (n <= 0)
+                break;
+            acc.append(resp, static_cast<size_t>(n));
+        }
+        assert(acc.find(" 101 ") != std::string::npos);
+
+        // Send an UNMASKED text frame: FIN|TEXT (0x81), len 3, no mask bit.
+        unsigned char frame[] = {0x81, 0x03, 'a', 'b', 'c'};
+        (void)send(fd, frame, sizeof(frame), 0);
+
+        // The server must close. We may first receive its Close frame, then EOF.
+        for (int i = 0; i < 100 && !server_closed; i++) {
+            char buf[64];
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n == 0) {
+                server_closed = true;
+            } else if (n < 0) {
+                break;  // recv timeout: server never closed
+            }
+        }
+    }
+    close(fd);
+
+    stop.store(true);
+    poller.join();
+    assert(server_closed);
+}
+
+// Observability counters: a full HTTP round-trip must move the cumulative
+// metrics (accepted/closed/bytes) and leave the live gauge back at zero.
+static void test_metrics()
+{
+    const uint16_t port = 18896;
+    Manager mgr;
+    Metrics before = mgr.metrics();
+    assert(before.accepted == 0 && before.closed == 0);
+    assert(before.bytes_read == 0 && before.bytes_written == 0);
+    assert(before.active == 0);
+
+    auto ref = mgr.http_listen(
+        std::string("http://127.0.0.1:") + std::to_string(port),
+        HandlerFn([](Connection& c, Event ev, void*) {
+            if (ev == Event::HttpMessage)
+                http_reply(&c, 200, "", "ok");
+        }));
+    assert(ref);
+
+    // Client runs in a background thread while the main thread drives the loop.
+    std::atomic<bool> got{false};
+    std::thread client([&got, port]() { got.store(http_get_200(port)); });
+
+    auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < deadline && !got.load())
+        mgr.poll(20ms);
+    client.join();
+    // A few more polls so the "Connection: close" teardown completes.
+    for (int i = 0; i < 10; i++)
+        mgr.poll(20ms);
+
+    assert(got.load());
+    Metrics after = mgr.metrics();
+    assert(after.accepted >= 1);       // the client connection was accepted
+    assert(after.closed >= 1);         // and closed after the response
+    assert(after.bytes_read > 0);      // the request was read
+    assert(after.bytes_written > 0);   // the response was written
+    assert(after.active == 0);         // live gauge back to zero
 }
 
 // Connection idle timeout: an accepted connection that sends nothing must be
@@ -874,6 +1248,48 @@ static void test_request_timeout()
 
     assert(server_closed);       // the never-completing request was reaped
     assert(closed.load() >= 1);
+}
+
+// Client connect timeout: a hung outbound connect() to a black-holed peer must
+// be reaped by the event loop after connect_timeout_ms, rather than lingering
+// for the (much longer) OS-default SYN timeout.
+struct ConnectTimeoutState {
+    std::atomic<int> closed{0};
+    std::atomic<int> connected{0};
+};
+
+static void connect_timeout_ev(Connection* c, int ev, void*)
+{
+    auto* st = static_cast<ConnectTimeoutState*>(c->fn_data);
+    if (ev == MG_EV_CONNECT)
+        st->connected.fetch_add(1, std::memory_order_relaxed);
+    else if (ev == MG_EV_CLOSE)
+        st->closed.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void test_connect_timeout()
+{
+    ConnectTimeoutState st;
+    Manager mgr;
+    mgr.set_connect_timeout(200);  // ms
+    assert(mgr.connect_timeout() == 200);
+
+    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): reserved and not routable, so the
+    // SYN goes unanswered and the connect stays pending until we reap it. Using
+    // an IP literal skips DNS, so only the connect phase is exercised.
+    auto* c = connect(mgr.raw(), "tcp://192.0.2.1:9", connect_timeout_ev, &st);
+    assert(c != nullptr);
+
+    // Pump the loop past the 200ms deadline (bounded well under any OS SYN
+    // timeout). The connection must be closed without ever connecting.
+    auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < deadline
+           && st.closed.load() == 0) {
+        mgr.poll(20ms);
+    }
+
+    assert(st.connected.load() == 0);  // never established
+    assert(st.closed.load() >= 1);     // reaped by the connect timeout
 }
 
 // Request-body cap: a request advertising a Content-Length over the cap must be
@@ -1227,6 +1643,10 @@ int main()
     test_timer_basic();
     test_scoped_enums();
     test_str_constructors();
+    test_http_header_limit();
+    test_http_multipart();
+    test_float_formatting();
+    test_str_match_span();
     test_check_ip_acl();
     test_listen_tls_unavailable_fails_closed();
 #if MG_TLS != MG_TLS_NONE
@@ -1243,8 +1663,13 @@ int main()
     }
 
 #ifndef _WIN32
+    test_http_chunked_request();
+    test_ws_echo_e2e();
+    test_ws_unmasked_frame_rejected();
+    test_metrics();
     test_idle_timeout();
     test_request_timeout();
+    test_connect_timeout();
     test_max_body_size();
     test_max_connections();
     test_max_send_buffer();

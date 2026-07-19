@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(nano-server VERSION 0.1.1 LANGUAGES C CXX)
+project(nano-server VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

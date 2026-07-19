@@ -254,6 +254,43 @@ enum { MG_IO_ERR = -1, MG_IO_WAIT = -2, MG_IO_RESET = -3 };
 #define MG_SOCKET_TYPE int
 #endif
 
+// Normalize the readiness-backend selectors so every one is defined to 0 or 1.
+// The per-platform logic above defines exactly one of them (or none, in which
+// case select() is the fallback); make the rest explicit 0 so they can appear
+// in static_assert expressions and plain arithmetic without relying on the
+// "undefined identifier evaluates to 0 in #if" rule.
+#ifndef MG_ENABLE_EPOLL
+#define MG_ENABLE_EPOLL 0
+#endif
+#ifndef MG_ENABLE_KQUEUE
+#define MG_ENABLE_KQUEUE 0
+#endif
+#ifndef MG_ENABLE_POLL
+#define MG_ENABLE_POLL 0
+#endif
+#ifndef MG_ENABLE_IO_URING
+#define MG_ENABLE_IO_URING 0
+#endif
+
+// The config matrix must be internally consistent. Catch a bad
+// MG_ARCH/MG_ENABLE_* combination here, at compile time, rather than as a
+// confusing failure deep in the socket layer at runtime or link time.
+static_assert(MG_ARCH == MG_ARCH_UNIX || MG_ARCH == MG_ARCH_WIN32,
+              "MG_ARCH must be MG_ARCH_UNIX or MG_ARCH_WIN32");
+// The readiness backends are mutually exclusive; at most one may be selected.
+// (When none is selected, the code falls back to select().)
+static_assert(MG_ENABLE_EPOLL + MG_ENABLE_KQUEUE + MG_ENABLE_POLL
+                  + MG_ENABLE_IO_URING <= 1,
+              "At most one of MG_ENABLE_EPOLL / KQUEUE / POLL / IO_URING "
+              "may be enabled");
+// epoll, kqueue and io_uring are POSIX-only and cannot pair with the Win32 arch.
+static_assert(MG_ARCH != MG_ARCH_WIN32
+                  || (MG_ENABLE_EPOLL == 0 && MG_ENABLE_KQUEUE == 0
+                      && MG_ENABLE_IO_URING == 0),
+              "epoll / kqueue / io_uring are not available on MG_ARCH_WIN32");
+// The socket backend underpins the entire networking core.
+static_assert(MG_ENABLE_SOCKET != 0, "MG_ENABLE_SOCKET must be enabled");
+
 // Epoll macros
 #if MG_ENABLE_EPOLL
 #define MG_EPOLL_ADD(c)                                                       \
@@ -316,6 +353,11 @@ enum { MG_IO_ERR = -1, MG_IO_WAIT = -2, MG_IO_RESET = -3 };
 
 // DNS defaults
 #define MG_DEFAULT_DNS_TIMEOUT_MS 3000
+// Default bound (ms) on how long a client-initiated connection may spend
+// resolving + connecting before the event loop gives up. Legitimate connects
+// finish far under this; it exists to reap a hung outbound connect(). Set to 0
+// via set_connect_timeout() to disable.
+#define MG_DEFAULT_CONNECT_TIMEOUT_MS 30000
 #define MG_DEFAULT_DNS4_URL "udp://8.8.8.8:53"
 #define MG_DEFAULT_DNS6_URL "udp://[2001:4860:4860::8888]:53"
 
@@ -555,11 +597,27 @@ void log_set_fn(PrintFn fn, void* param);
 
 #define mg_log_set(level_) nanosrv::log_level = (level_)
 
+// Compile-time log floor. Sites whose level exceeds MG_LOG_LEVEL_MAX are dead
+// code (the `(level) <= MG_LOG_LEVEL_MAX` term is a compile-time constant, so
+// the compiler drops the branch, its argument evaluation, and its string
+// literals). This is stronger than the runtime `log_level` gate: a compiled-out
+// site cannot be re-enabled by mg_log_set(). Default: keep Debug/Verbose in
+// debug builds, compile them out in release (NDEBUG). Override on the command
+// line, e.g. -DMG_LOG_LEVEL_MAX=MG_LL_VERBOSE to keep everything in a release
+// build, or =MG_LL_ERROR to strip all but errors.
+#ifndef MG_LOG_LEVEL_MAX
+#ifdef NDEBUG
+#define MG_LOG_LEVEL_MAX MG_LL_INFO
+#else
+#define MG_LOG_LEVEL_MAX MG_LL_VERBOSE
+#endif
+#endif
+
 #if MG_ENABLE_LOG
 #define MG___FUNC__ __func__
 #define MG_LOG(level, args)                                                   \
     do {                                                                      \
-        if ((level) <= nanosrv::log_level) {                                 \
+        if ((level) <= MG_LOG_LEVEL_MAX && (level) <= nanosrv::log_level) {   \
             nanosrv::log_prefix((level), __FILE__, __LINE__, MG___FUNC__);   \
             nanosrv::log args;                                               \
         }                                                                     \
