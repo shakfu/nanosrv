@@ -276,6 +276,14 @@ listener closes.
   graceful-drain support, but treat exposure to untrusted clients as
   experimental. See [SECURITY.md](SECURITY.md) for the current threat-model
   posture and how to report a vulnerability.
+- **DNS uses the system resolver.** Outbound name resolution reads the first
+  `nameserver` entry of each family from `/etc/resolv.conf` at startup, falling
+  back to a public resolver only when that file names none (and on Windows,
+  which has no such file). Earlier versions always used a hardcoded
+  `8.8.8.8`, which ignored split-horizon DNS, container and VPN resolvers, and
+  sent every query off the host. Override by assigning `mgr->dns4.url` /
+  `dns6.url` after construction.
+
 - **Observability.** `Manager.metrics` / `ShardedManager.metrics` expose
   cumulative counters (accepted, closed, errors, bytes read/written) plus a live
   connection gauge for health/metrics endpoints.
@@ -459,6 +467,21 @@ make server-test    # build and run C++ tests via ctest
 make server-clean   # remove CMake build directory
 make bench          # run wrk benchmarks (builds everything first)
 ```
+
+### Poller backend
+
+Linux uses `epoll`, BSD and macOS use `kqueue`, and everything else falls back
+to `poll()`. `io_uring` is available with `-DMG_ENABLE_IO_URING=1` but is not
+recommended yet: it is used in readiness (`POLL_ADD`) mode rather than for
+submitted async I/O, so it offers no throughput advantage over epoll. It used
+to switch itself on whenever `<liburing.h>` happened to be installed, which
+made the poller a property of the build machine rather than of the build.
+
+### Runtime environment variables
+
+| Variable | Effect |
+|---|---|
+| `NANOSRV_LEAK_WARNINGS=1` | Re-enable nanobind's "leaked N instances" report at interpreter shutdown. Off by default: objects still alive at exit (a module-level `Manager`, say) are not leaks, and the warning read as a bug report for normal usage. |
 
 ### TLS backend (opt-in)
 

@@ -282,4 +282,115 @@ void* mem_calloc(size_t count, size_t size) { return calloc(count, size); }
 void mem_free(void* ptr) { free(ptr); }
 #endif
 
+
+// ---------------------------------------------------------------------------
+// System resolver discovery
+// ---------------------------------------------------------------------------
+//
+// The default DNS server used to be a hardcoded MG_DEFAULT_DNS4_URL
+// ("udp://8.8.8.8:53"), so outbound name resolution ignored the host's own
+// configuration: internal names silently failed to resolve, split-horizon DNS
+// was bypassed, queries left the network, and a container or VPN resolver was
+// never consulted. Read the system resolver instead, keeping the old constant
+// only as a fallback.
+
+std::string parse_resolv_conf(std::string_view contents, bool want_ipv6)
+{
+    size_t pos = 0;
+    while (pos < contents.size()) {
+        size_t eol = contents.find('\n', pos);
+        std::string_view line = contents.substr(
+            pos, eol == std::string_view::npos ? std::string_view::npos : eol - pos);
+        pos = (eol == std::string_view::npos) ? contents.size() : eol + 1;
+
+        // Trim leading blanks; skip comments (# and ; are both used).
+        size_t b = line.find_first_not_of(" \t\r");
+        if (b == std::string_view::npos)
+            continue;
+        line.remove_prefix(b);
+        if (line[0] == '#' || line[0] == ';')
+            continue;
+
+        constexpr std::string_view kw = "nameserver";
+        if (line.size() <= kw.size() || line.compare(0, kw.size(), kw) != 0)
+            continue;
+        if (line[kw.size()] != ' ' && line[kw.size()] != '\t')
+            continue;  // "nameservers" and friends are not this directive
+
+        std::string_view rest = line.substr(kw.size());
+        size_t s0 = rest.find_first_not_of(" \t");
+        if (s0 == std::string_view::npos)
+            continue;
+        rest.remove_prefix(s0);
+        size_t s1 = rest.find_first_of(" \t\r#;");
+        std::string_view addr =
+            (s1 == std::string_view::npos) ? rest : rest.substr(0, s1);
+        if (addr.empty())
+            continue;
+
+        // resolv.conf may carry an IPv6 zone ("fe80::1%eth0"); keep it, the
+        // address parser understands the scope suffix.
+        bool is_ipv6 = addr.find(':') != std::string_view::npos;
+        if (is_ipv6 != want_ipv6)
+            continue;
+
+        std::string url = "udp://";
+        if (is_ipv6) {
+            url += '[';
+            url.append(addr);
+            url += ']';
+        } else {
+            url.append(addr);
+        }
+        url += ":53";
+        return url;
+    }
+    return {};
+}
+
+// Read /etc/resolv.conf and pick the first nameserver of the given family.
+// Returns empty on Windows (no such file) or when the file is absent,
+// unreadable, or names no server of that family -- the caller falls back.
+static std::string read_resolv_conf_field(bool want_ipv6)
+{
+#if MG_ARCH == MG_ARCH_WIN32
+    (void)want_ipv6;
+    return {};
+#else
+    FILE* f = fopen("/etc/resolv.conf", "re");
+    if (f == NULL)
+        return {};
+    std::string contents;
+    char buf[512];
+    size_t n;
+    // resolv.conf is small; cap the read so a pathological file cannot make
+    // startup allocate without bound.
+    constexpr size_t kMaxRead = 64 * 1024;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        contents.append(buf, n);
+        if (contents.size() >= kMaxRead)
+            break;
+    }
+    fclose(f);
+    return parse_resolv_conf(contents, want_ipv6);
+#endif
+}
+
+const char* system_dns_url(bool ipv6)
+{
+    // Read once per process: resolv.conf is re-read by libc resolvers on
+    // change, but a long-lived server that cached a resolver at startup is the
+    // established behaviour here, and this keeps the returned pointer stable
+    // for the lifetime of every Mgr that stores it.
+    static const std::string v4 = [] {
+        std::string s = read_resolv_conf_field(false);
+        return s.empty() ? std::string(MG_DEFAULT_DNS4_URL) : s;
+    }();
+    static const std::string v6 = [] {
+        std::string s = read_resolv_conf_field(true);
+        return s.empty() ? std::string(MG_DEFAULT_DNS6_URL) : s;
+    }();
+    return ipv6 ? v6.c_str() : v4.c_str();
+}
+
 } // namespace nanosrv

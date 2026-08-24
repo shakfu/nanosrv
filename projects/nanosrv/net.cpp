@@ -398,8 +398,10 @@ void mgr_init(struct Mgr* mgr)
     mgr->id_stride = 1;  // see Mgr::id_stride; ShardedManager overrides this
     mgr->dnstimeout = MG_DEFAULT_DNS_TIMEOUT_MS;
     mgr->connect_timeout_ms = MG_DEFAULT_CONNECT_TIMEOUT_MS;
-    mgr->dns4.url = MG_DEFAULT_DNS4_URL;
-    mgr->dns6.url = MG_DEFAULT_DNS6_URL;
+    // The host's own resolver, not a hardcoded public one: see system_dns_url().
+    // Override after mgr_init by assigning mgr->dns4.url / dns6.url directly.
+    mgr->dns4.url = system_dns_url(false);
+    mgr->dns6.url = system_dns_url(true);
     tls_ctx_init(mgr);
     MG_DEBUG(("MG_IO_SIZE: %lu, TLS: %s", MG_IO_SIZE,
               MG_TLS == MG_TLS_NONE          ? "none"

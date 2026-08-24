@@ -38,12 +38,28 @@
 #include <mach/mach_time.h>
 #endif
 
+// Readiness backend selection.
+//
+// io_uring is opt-in (-DMG_ENABLE_IO_URING=1), not auto-detected. It used to be
+// enabled by __has_include(<liburing.h>), which made the poller depend on
+// whether a development package happened to be installed on the build machine:
+// two builds of the same source, same compiler, could use different pollers,
+// which is a poor property for reproducible builds and for benchmark
+// comparisons. The auto-detection was also broken -- setting
+// MG_ENABLE_IO_URING=1 explicitly skipped this branch and fell through to the
+// epoll branch, enabling both and tripping the mutual-exclusion static_assert
+// below. Note the backend is used in readiness (POLL_ADD) mode rather than for
+// submitted async I/O, so it offers no throughput advantage over epoll today.
 #if !defined(MG_ENABLE_KQUEUE) && (defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__))
 #define MG_ENABLE_KQUEUE 1
-#elif !defined(MG_ENABLE_IO_URING) && defined(__linux__) && __has_include(<liburing.h>)
-#define MG_ENABLE_IO_URING 1
-#elif !defined(MG_ENABLE_EPOLL) && defined(__linux__)
+#elif defined(__linux__)
+#if defined(MG_ENABLE_IO_URING) && MG_ENABLE_IO_URING
+#if !__has_include(<liburing.h>)
+#error "MG_ENABLE_IO_URING=1 but <liburing.h> was not found (install liburing-dev)"
+#endif
+#elif !defined(MG_ENABLE_EPOLL)
 #define MG_ENABLE_EPOLL 1
+#endif
 #elif !defined(MG_ENABLE_POLL)
 #define MG_ENABLE_POLL 1
 #endif

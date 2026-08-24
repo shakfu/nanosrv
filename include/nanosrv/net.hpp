@@ -226,6 +226,19 @@ bool aton(struct Str str, struct Address* addr);
 // negative = malformed ACL. NOTE: this is a building block; ACLs are not yet
 // wired into the accept path (no listener enforces one automatically).
 int check_ip_acl(struct Str acl, struct Address* remote_ip);
+
+// Extract the first `nameserver` entry of the requested family from the
+// contents of a resolv.conf, returned as a "udp://host:53" URL. Empty if the
+// file names no server of that family. Takes the contents rather than a path so
+// it is testable without touching the filesystem.
+std::string parse_resolv_conf(std::string_view contents, bool want_ipv6);
+
+// The system resolver for this host, as a "udp://host:53" URL, read once per
+// process from /etc/resolv.conf and cached. Falls back to
+// MG_DEFAULT_DNS4_URL / MG_DEFAULT_DNS6_URL when the file names no usable
+// server (and on Windows, which has no resolv.conf). Managers use this by
+// default instead of a hardcoded public resolver.
+const char* system_dns_url(bool ipv6);
 bool wakeup(struct Mgr*, unsigned long id, const void* buf, size_t len);
 
 [[nodiscard]] struct Connection* alloc_conn(struct Mgr*);

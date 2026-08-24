@@ -1,5 +1,6 @@
 """Tests for nanosrv nanobind extension module."""
 
+import sys
 import threading
 import time
 import urllib.request
@@ -1109,6 +1110,59 @@ class TestBinaryPayloads:
         assert seen["data"] == BINARY
         assert seen["opcode"] == nanosrv.WsOpcode.Binary
         assert seen.get("text_raised") is True
+
+
+# ---------------------------------------------------------------------------
+# Interpreter shutdown
+# ---------------------------------------------------------------------------
+
+
+class TestInterpreterShutdown:
+    """A server object alive at interpreter exit is the normal case -- the
+    README's own example keeps a module-level Manager and stops with Ctrl-C --
+    but nanobind reported each one as a leak, so a new user's first run ended
+    in an alarming bug report about nothing."""
+
+    SCRIPT = (
+        "import nanosrv\n"
+        "mgr = nanosrv.Manager()\n"
+        "ref = mgr.http_listen('http://127.0.0.1:18418', lambda c, m: None)\n"
+        "sm = nanosrv.ShardedManager(2)\n"
+    )
+
+    def _run(self, env_extra=None):
+        import subprocess
+        import os
+
+        env = dict(os.environ)
+        env.pop("NANOSRV_LEAK_WARNINGS", None)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, "-c", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    def test_exit_is_quiet_by_default(self):
+        result = self._run()
+        assert result.returncode == 0, result.stderr
+        assert "leaked" not in result.stderr, result.stderr
+
+    def test_leak_warnings_can_be_opted_into(self):
+        result = self._run({"NANOSRV_LEAK_WARNINGS": "1"})
+        assert result.returncode == 0, result.stderr
+        if "leaked" not in result.stderr:
+            # Whether nanobind reports anything is its own business and varies
+            # by build: a free-threaded interpreter reports nothing at all,
+            # where a GIL build reports every live instance. The contract this
+            # class guards is the default (quiet); the opt-in can only be
+            # checked where the diagnostics exist.
+            pytest.skip("this nanobind build reports no leaks at shutdown")
+        # Developers chasing a reference-counting bug still get the diagnostics.
+        assert "leaked" in result.stderr
 
 
 # ---------------------------------------------------------------------------

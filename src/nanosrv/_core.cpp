@@ -7,6 +7,7 @@
 
 #include <nanosrv/nanosrv.hpp>
 
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -398,6 +399,17 @@ static bool py_ref_send_bytes(nanosrv::ConnectionRef& ref, nb::handle data)
 
 NB_MODULE(_core, m) {
     m.doc() = "nanosrv -- Python bindings for the nanosrv embedded server library";
+
+    // nanobind reports every instance still alive when the interpreter shuts
+    // down as a leak ("nanobind: leaked 3 instances! ... likely caused by a
+    // reference counting issue"). The canonical usage in the README -- a
+    // module-level Manager, stopped with Ctrl-C -- leaves exactly that, so the
+    // first thing a new user saw on exit was an alarming bug report about
+    // nothing. Objects held to the end of the process are not leaks. Set
+    // NANOSRV_LEAK_WARNINGS=1 to restore the warnings when actually chasing a
+    // reference-counting bug in the bindings.
+    if (std::getenv("NANOSRV_LEAK_WARNINGS") == nullptr)
+        nb::set_leak_warnings(false);
 
     // -----------------------------------------------------------------------
     // Enums

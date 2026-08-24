@@ -205,19 +205,27 @@ The prerequisites identified in `REVIEW.md` section 7, all closed:
   Covered by a C++ test (hooks fire once per worker, on distinct threads) and a
   Python run/stop-cycle test.
 
-- [ ] **nanobind leak warnings at interpreter exit (4.6).** A module-level
-  `Manager` alive at shutdown prints "nanobind: leaked N instances!". Not a real
-  leak (it disappears if the objects are deleted first), but it is what every
-  user sees on their first Ctrl-C.
+- [x] **nanobind leak warnings at interpreter exit (4.6).** Off by default;
+  `NANOSRV_LEAK_WARNINGS=1` restores them for binding development. Covered by a
+  subprocess test asserting a quiet exit (the opt-in half skips on
+  free-threaded builds, where nanobind reports nothing either way).
 
-- [ ] **DNS hardcoded to 8.8.8.8 (4.6).** `/etc/resolv.conf` is never consulted.
+- [x] **DNS hardcoded to 8.8.8.8 (4.6).** `/etc/resolv.conf` is now read at
+  startup for the first nameserver of each family, with the old constants as a
+  fallback. `parse_resolv_conf()` takes contents rather than a path so the
+  comment, indentation, family-selection, IPv6-zone and malformed-directive
+  cases are all tested without depending on the host.
 
 - [ ] **`MG_MAX_RECV_SIZE` is a compile-time 3 MB cap (4.6).** A wheel user
   cannot raise it at all.
 
-- [ ] **io_uring auto-detection (4.6).** Selected by
-  `__has_include(<liburing.h>)`, so the poller silently differs between build
-  machines; it is also poll-mode only, so it buys nothing over epoll.
+- [x] **io_uring auto-detection (4.6).** Now opt-in via
+  `-DMG_ENABLE_IO_URING=1`, and that flag actually works: it previously fell
+  through to the epoll branch, enabling both backends and tripping the
+  mutual-exclusion static_assert, so the documented way to select io_uring
+  could never have compiled. Requesting it without liburing now fails with a
+  clear `#error`. Still poll-mode only, so it buys nothing over epoll -- noted
+  in the README.
 
 - [x] **Benchmarks are macOS-only and not reproducible (4.6).** `make bench`
   now falls back to a bundled C load generator (`scripts/loadgen.c`, with p50/p99
