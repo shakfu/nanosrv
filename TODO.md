@@ -219,11 +219,19 @@ The prerequisites identified in `REVIEW.md` section 7, all closed:
   `__has_include(<liburing.h>)`, so the poller silently differs between build
   machines; it is also poll-mode only, so it buys nothing over epoll.
 
-- [ ] **Benchmarks are macOS-only (4.6).** Not reproducible as published: `wrk`
-  is undocumented as a prerequisite and no Linux numbers exist. The sharded
-  design is justified by a macOS `SO_REUSEPORT` limitation that does not apply
-  on Linux, where per-worker `SO_REUSEPORT` listeners would avoid the
-  accept-and-hand-off tax.
+- [x] **Benchmarks are macOS-only and not reproducible (4.6).** `make bench`
+  now falls back to a bundled C load generator (`scripts/loadgen.c`, with p50/p99
+  by reservoir sampling) when `wrk` is absent, so it no longer depends on an
+  unlisted external tool. Two methodology defects fixed along the way: the
+  sharded servers replied with a constant string while the others formatted a
+  body (so the table compared different workloads), and all build trees shared
+  one output directory (so a sanitizer build could silently leave an
+  instrumented binary where the benchmark looks for a release one). Re-measured
+  on Linux, which inverts the macOS conclusions -- sharding is 4.07x mongoose
+  for a trivial handler there, not 11% slower. The README carries both results
+  and says to measure per platform. Still open: nobody has re-run macOS with the
+  corrected handlers, and per-worker `SO_REUSEPORT` listeners on Linux (which
+  would avoid the accept-and-hand-off tax entirely) remain untried.
 
 ---
 

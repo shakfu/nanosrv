@@ -48,11 +48,13 @@ The project provides six server implementations: five built on the nanosrv netwo
 
 **nanosrv-server** wraps the C core in a C++ RAII layer. `Manager` owns the `mg_mgr` and provides `http_listen()` with typed `std::function<void(Connection&, HttpMessage&)>` callbacks -- no manual event code checks or void pointer casts. The cost is one virtual call through `std::function` per request. The C++ layer also adds `ConnectionRef`, typed enums (`Event`, `WsOpcode`, `LogLevel`), and convenience methods on `Connection` and `HttpMessage`.
 
-**nanosrv-sharded** uses a single acceptor thread that listens for connections and distributes accepted socket FDs round-robin to N worker threads. Each worker runs its own independent `Manager` event loop. On accept, the FD is detached from the acceptor's kqueue/epoll (via `detach_fd()`), pushed to a per-worker lock-protected queue, and adopted by the worker using `wrapfd()` with the HTTP protocol handler installed. This avoids the macOS SO_REUSEPORT limitation (which does not load-balance across listeners) and provides true connection-level parallelism.
+**nanosrv-sharded** uses a single acceptor thread that listens for connections and distributes accepted socket FDs round-robin to N worker threads. Each worker runs its own independent `Manager` event loop. On accept, the FD is detached from the acceptor's kqueue/epoll (via `detach_fd()`), pushed to a per-worker lock-protected queue, and adopted by the worker using `wrapfd()` with the HTTP protocol handler installed. Hand-off rather than `SO_REUSEPORT` because macOS does not load-balance across `SO_REUSEPORT` listeners; Linux does, so a per-worker listener would avoid the hand-off entirely there and is worth trying if you only target Linux.
 
 **nanosrv Python Manager** exposes the C++ `Manager` class to Python via nanobind. The GIL is released during `poll()` so the event loop can process I/O without blocking Python threads. When a request arrives, the C++ trampoline acquires the GIL, calls the Python handler, and releases it again. The overhead per request is one GIL acquire/release cycle plus the Python-to-C++ marshalling (~100us at the scale we measured).
 
-**nanosrv Python ShardedManager** exposes the C++ `ShardedManager` to Python. Worker threads each run their own event loop (GIL released), acquiring the GIL only to execute the Python callback. Each worker thread registers with CPython once, when it starts, rather than once per request. On a GIL interpreter the parallelism benefits the C++-side work (event loop, parsing, socket I/O) but not the Python handler itself, which the GIL still serializes: measured against a single-threaded `Manager` on Linux, 1.7x for a trivial handler and 0.96x for one doing ~100us of pure Python. On a free-threaded interpreter the Python handler parallelises too -- 3.4x and 4.3x for those same two cases. See [Free-threaded CPython](#free-threaded-cpython-313t-and-later).
+**nanosrv Python ShardedManager** exposes the C++ `ShardedManager` to Python. Worker threads each run their own event loop (GIL released), acquiring the GIL only to execute the Python callback. Each worker thread registers with CPython once, when it starts, rather than once per request. On a GIL interpreter the parallelism benefits the C++-side work (event loop, parsing, socket I/O) but not the Python handler itself, which the GIL still serializes -- so it peaks early and then decays. Measured against a single-threaded `Manager` (195,584 req/s) on the same machine and workload: 1.56x at 2 workers, 1.43x at 4, 1.15x at 8, and 1.03x at 16, with p99 latency climbing from 495us to 1.35ms as workers contend. On a free-threaded interpreter it keeps scaling instead: 3.88x at 16 workers. See [Free-threaded CPython](#free-threaded-cpython-313t-and-later).
+
+**Pick the worker count deliberately.** `ShardedManager(0)` means "one worker per hardware thread", which is right on a free-threaded interpreter and the *worst* choice on a GIL one -- on this 16-thread machine the default landed at 1.03x `Manager` while 2 workers gave 1.56x.
 
 ### Feature Comparison
 
@@ -280,29 +282,44 @@ listener closes.
 
 ### Performance
 
-Benchmarked with `wrk -t4 -c100 -d10s` on Apple Silicon (M2, 8 cores).
+Benchmarked on Linux x86_64 (i7-12650H, 16 threads) with 100 connections for
+10s. **Every server runs the same handler** (parse the request, format the
+method and URI into the response body) -- the two sharded servers previously
+replied with a constant string while the other four formatted a body, so the
+old comparison measured different workloads.
 
 #### Trivial handler (no CPU work)
 
 | Server | Req/sec | Avg Latency | p99 Latency | vs mongoose |
 |---|---|---|---|---|
-| mongoose 7.21 (C) | 205,744 | 466us | 779us | -- |
-| mungo-server (C) | 208,152 | 461us | 860us | +1% |
-| nanosrv-server (C++) | 200,851 | 486us | 817us | -2% |
-| nanosrv-sharded (C++, 8 workers) | 183,784 | 683us | 8.5ms | -11% |
-| nanosrv Python Manager (Python) | 161,698 | 610us | 1.24ms | -21% |
-| nanosrv Python ShardedManager (Python, 8 workers) | 86,769 | 1.15ms | 2.67ms | -58% |
+| mongoose 7.21 (C) | 214,206 | 467us | 668us | -- |
+| mungo-server (C) | 220,003 | 454us | 643us | +3% |
+| nanosrv-server (C++) | 219,193 | 456us | 498us | +2% |
+| nanosrv-sharded (C++, 16 workers) | 871,977 | 115us | 251us | **4.07x** |
+| nanosrv Python Manager | 207,506 | 482us | 537us | -3% |
+| nanosrv Python ShardedManager (GIL) | 221,723 | 451us | 1.17ms | +4% |
+| nanosrv Python ShardedManager (free-threaded) | 772,108 | 129us | 310us | **3.60x** |
 
-**The two Python rows above predate the per-worker thread-registration fix**
-(workers used to register with CPython once per request instead of once per
-thread). On Linux the same change took a trivial-handler `ShardedManager` from
-126K to 648K req/s, so the `ShardedManager` figure in particular understates
-the current code by a wide margin; these macOS numbers have not been re-run.
-The C and C++ rows are unaffected. See
-[Free-threaded CPython](#free-threaded-cpython-313t-and-later) for current,
-reproducible Python numbers.
+The three single-threaded servers land within 3% of each other: extracting
+mungo from Mongoose costs nothing, and the C++ wrapper's `std::function`
+dispatch is inside the noise. The sharded servers scale with cores -- 4.07x for
+C++, 3.60x for Python on a free-threaded interpreter. The Python `Manager`
+retains 97% of mongoose's throughput, because at this request rate the work is
+dominated by the event loop and parser rather than by the callback.
 
-With a trivial handler, the single-threaded C servers dominate. Mongoose 7.21 and mungo-server are within noise of each other (~206K vs ~208K req/s), confirming that nanosrv's extraction from Mongoose introduces no performance regression despite removing ~27K lines of code. The C++ wrapper costs ~2% for `std::function` dispatch. The sharded server pays an accept-and-hand-off tax (mutex, queue, FD re-registration in kqueue) that exceeds the benefit when there is no CPU work to parallelize. The nanosrv Python Manager retains ~79% of native C throughput -- the remaining cost is GIL acquire/release per request. The nanosrv Python ShardedManager is slowest here because multiple worker threads contend for the GIL to run a trivial Python callback.
+The GIL-bound Python `ShardedManager` reaches C-server throughput but no
+further: its 16 workers serialise on the GIL to run the handler, which is
+visible in its p99 (1.17ms, more than double any other server) -- throughput is
+fine, tail latency is where the contention shows up. On a free-threaded
+interpreter that constraint disappears.
+
+**These numbers are platform-dependent, and earlier macOS measurements said the
+opposite about sharding.** On an 8-core M2 the sharded C++ server measured 11%
+*slower* than mongoose for a trivial handler, and the accept-and-hand-off tax
+was cited as the reason. That conclusion does not hold on Linux, where epoll and
+16 hardware threads turn the same design into a 4x win. If you are choosing
+between `Manager` and `ShardedManager`, measure on your target platform --
+`make bench` does exactly this run.
 
 #### CPU-bound handler (busy spin)
 
@@ -310,13 +327,17 @@ The `--busy <us>` flag on the C++ servers adds a CPU spin loop to the handler, s
 
 | Busy (us) | Single req/s | Sharded req/s | Speedup |
 |---|---|---|---|
-| 0 | 200,315 | 186,308 | 0.93x |
-| 10 | 66,181 | 145,511 | **2.2x** |
-| 50 | 18,284 | 88,111 | **4.8x** |
-| 100 | 9,542 | 51,804 | **5.4x** |
-| 500 | 1,958 | 12,062 | **6.2x** |
+| 0 | 215,250 | 880,296 | 4.09x |
+| 10 | 69,853 | 546,505 | **7.8x** |
+| 50 | 18,376 | 224,740 | **12.2x** |
+| 100 | 9,596 | 132,567 | **13.8x** |
+| 500 | 1,977 | 30,003 | **15.2x** |
 
-With just 10us of handler work the sharded server already doubles throughput. At 500us (realistic for a database query or large JSON response) it delivers 6.2x speedup across 8 workers -- near-linear scaling. The crossover point is around 5-10us of handler CPU time.
+Sharding wins at every level of handler work on this machine, and the advantage
+widens as the handler gets heavier: 15.2x at 500us (realistic for a database
+query or a large JSON response) across 16 workers, which is close to linear.
+There is no crossover point here -- on 8-core macOS there was one, at around
+5-10us of handler CPU time. Measure on your own hardware.
 
 #### Free-threaded CPython (3.13t and later)
 
@@ -350,6 +371,11 @@ Free-threaded CPython executes single-threaded Python roughly 30% slower
 (the same handler costs 119.5us there against 93us under the GIL), so one
 worker is slower and the crossover is at two.
 
+The same inversion shows up with a trivial handler, where the work is nearly
+all event loop and parser: against a single-threaded `Manager` at 195,584
+req/s, the GIL build peaks at 1.56x (2 workers) and decays to 1.03x by 16,
+while the free-threaded build reaches 3.88x at 16 workers.
+
 **Your handler really is concurrent.** With no GIL, handlers on different
 workers run at the same instant rather than interleaving, so shared state in
 your handler needs its own locking. The bindings and the C++ core are safe: the
@@ -362,6 +388,12 @@ payload-verified) completes with zero errors.
 ```bash
 make bench    # builds everything, runs all benchmarks, generates HTML report
 ```
+
+`make bench` uses [wrk](https://github.com/wg/wrk) when it is installed and
+otherwise builds the bundled `scripts/loadgen.c` (a threaded keep-alive load
+generator, needing only a C compiler), so the benchmarks run on a bare machine.
+Set `NANOSRV_FT_PYTHON` to a free-threaded interpreter that has nanosrv
+installed to add the free-threaded Python row.
 
 ```bash
 # GIL vs free-threaded scaling for ShardedManager (needs `uv python install 3.13t`)
@@ -378,11 +410,11 @@ This produces terminal output and an HTML report at `build/bench-report.html` wi
 
 **nanosrv-server** -- The default choice for C++ projects. Typed callbacks, RAII, and `std::function` handlers make it safer and more ergonomic than the C API with negligible overhead (~2%). Use this for any single-threaded C++ server where the handler is fast (under ~5us) or where simplicity matters more than multi-core scaling.
 
-**nanosrv-sharded** -- Use when your handler does real CPU work (>10us per request): computation, serialization, database query building, or any blocking operation. The accept-and-hand-off architecture distributes connections across workers for true parallelism. Not worth the overhead for trivial handlers -- the single-threaded server will be faster in that case.
+**nanosrv-sharded** -- The default choice for a multi-core C++ server on Linux, where it measured 4x the single-threaded server even for a trivial handler and 15x with 500us of handler work. On macOS (8-core M2) the accept-and-hand-off tax made it a loss below roughly 10us of handler work, so on that platform reserve it for handlers doing real CPU work: computation, serialization, query building, or a blocking call. Measure before assuming either result applies to your machine.
 
 **nanosrv Python Manager** -- The default choice for Python projects. You get 79% of native C throughput with a Pythonic API. The single-threaded event loop avoids GIL contention entirely. Use this for Python HTTP/WebSocket servers, prototyping, scripting, or any case where Python handler logic is the bottleneck (since the GIL already serializes it, multiple threads won't help).
 
-**nanosrv Python ShardedManager** -- The default choice on a free-threaded interpreter (3.13t and later), where Python handler code runs genuinely in parallel: 3.4x a single-threaded `Manager` for a trivial handler and 4.3x for one doing ~100us of pure Python. On a GIL interpreter it still helps when the per-request cost is mostly outside Python -- event loop, parsing, socket I/O, or a handler that calls into C extensions or GIL-releasing I/O (1.7x for a trivial handler at 2-4 workers) -- but not when the handler is pure Python, which the GIL serializes regardless (0.96x). Rule of thumb: free-threaded, use it; GIL and your handler is mostly Python, use `Manager`.
+**nanosrv Python ShardedManager** -- The default choice on a free-threaded interpreter (3.13t and later), where Python handler code runs genuinely in parallel: 3.9x a single-threaded `Manager` for a trivial handler at 16 workers, and 4.3x for a handler doing ~120us of pure Python. On a GIL interpreter it helps only when the per-request cost is mostly outside Python -- event loop, parsing, socket I/O, or a handler calling into C extensions or GIL-releasing I/O -- and only at a low worker count (1.56x at 2 workers, falling to 1.03x at 16). For a pure-Python handler under the GIL it is a small loss, because the GIL serialises exactly the part you are trying to parallelise. Rule of thumb: free-threaded, use it with one worker per core; GIL, use `Manager` unless you have measured otherwise.
 
 **Decision flowchart:**
 

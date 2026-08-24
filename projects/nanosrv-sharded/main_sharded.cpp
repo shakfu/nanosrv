@@ -102,8 +102,16 @@ int main(int argc, char** argv)
     mgr.http_listen(url,
         [](Connection& c, HttpMessage& hm) {
             busy_spin(s_busy_us);
-            http_reply(&c, 200, "Content-Type: text/plain\r\n", "OK\n");
-            (void)hm;
+            // Same response as nanosrv-server, mungo-server and mongoose-server
+            // (and the Python benchmark servers): a benchmark that compares
+            // implementations is only meaningful if they do identical work.
+            // This previously replied with a constant "OK\n" while every other
+            // server formatted the method and URI into the body, so the
+            // comparison was measuring different workloads.
+            http_reply(&c, 200, "Content-Type: text/plain\r\n",
+                       "nanosrv-sharded ready\nMethod: %.*s, URI: %.*s\n",
+                       static_cast<int>(hm.method_str().size()), hm.method_str().data(),
+                       static_cast<int>(hm.uri_str().size()), hm.uri_str().data());
         });
 
     printf("nanosrv-sharded listening on %s (%u workers)\n",

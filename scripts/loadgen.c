@@ -21,7 +21,19 @@ static volatile int g_stop = 0;
 static const char *g_host, *g_path;
 static int g_port;
 
-struct result { long count; long errors; double lat_sum; };
+// Latency samples are kept by reservoir sampling (Vitter's algorithm R): a
+// uniform sample of the whole run in bounded memory, rather than the first N
+// (which would be all warm-up) or the last N (which would miss a slow start).
+#define SAMPLE_CAP 20000
+
+struct result {
+    long count;
+    long errors;
+    double lat_sum;
+    double samples[SAMPLE_CAP];
+    long nsamples;
+    unsigned seed;
+};
 
 static double now_s(void) {
     struct timespec ts;
@@ -68,6 +80,23 @@ static int read_response(int fd, char *buf, size_t cap) {
     return 0;
 }
 
+static void record(struct result *r, double latency) {
+    r->lat_sum += latency;
+    if (r->nsamples < SAMPLE_CAP) {
+        r->samples[r->nsamples++] = latency;
+    } else {
+        // Replace an existing sample with probability SAMPLE_CAP/count.
+        long j = (long)((double)rand_r(&r->seed) / ((double)RAND_MAX + 1.0)
+                        * (double)(r->count + 1));
+        if (j < SAMPLE_CAP) r->samples[j] = latency;
+    }
+}
+
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 static void *worker(void *arg) {
     struct result *r = (struct result *)arg;
     char req[512];
@@ -85,7 +114,7 @@ static void *worker(void *arg) {
         if (read_response(fd, buf, sizeof(buf)) != 0) {
             close(fd); fd = -1; r->errors++; continue;
         }
-        r->lat_sum += now_s() - t0;
+        record(r, now_s() - t0);
         r->count++;
     }
     if (fd >= 0) close(fd);
@@ -102,6 +131,8 @@ int main(int argc, char **argv) {
 
     pthread_t *th = calloc((size_t)conns, sizeof(pthread_t));
     struct result *res = calloc((size_t)conns, sizeof(struct result));
+    if (!th || !res) { fprintf(stderr, "out of memory\n"); return 1; }
+    for (int i = 0; i < conns; i++) res[i].seed = (unsigned)(i * 2654435761u + 1u);
     double t0 = now_s();
     for (int i = 0; i < conns; i++) pthread_create(&th[i], NULL, worker, &res[i]);
     usleep((useconds_t)(secs * 1e6));
@@ -109,11 +140,27 @@ int main(int argc, char **argv) {
     for (int i = 0; i < conns; i++) pthread_join(th[i], NULL);
     double elapsed = now_s() - t0;
 
-    long total = 0, errors = 0; double lat = 0;
-    for (int i = 0; i < conns; i++) { total += res[i].count; errors += res[i].errors; lat += res[i].lat_sum; }
-    printf("{\"requests\": %ld, \"errors\": %ld, \"seconds\": %.3f, \"rps\": %.1f, \"mean_latency_us\": %.1f}\n",
+    long total = 0, errors = 0, nsamp = 0; double lat = 0;
+    for (int i = 0; i < conns; i++) {
+        total += res[i].count; errors += res[i].errors; lat += res[i].lat_sum;
+        nsamp += res[i].nsamples;
+    }
+
+    double *all = nsamp ? malloc((size_t)nsamp * sizeof(double)) : NULL;
+    long k = 0;
+    if (all) {
+        for (int i = 0; i < conns; i++)
+            for (long j = 0; j < res[i].nsamples; j++) all[k++] = res[i].samples[j];
+        qsort(all, (size_t)k, sizeof(double), cmp_double);
+    }
+    double p50 = k ? all[(long)(0.50 * (double)(k - 1))] : 0.0;
+    double p99 = k ? all[(long)(0.99 * (double)(k - 1))] : 0.0;
+
+    printf("{\"requests\": %ld, \"errors\": %ld, \"seconds\": %.3f, \"rps\": %.1f, "
+           "\"mean_latency_us\": %.1f, \"p50_latency_us\": %.1f, "
+           "\"p99_latency_us\": %.1f, \"samples\": %ld}\n",
            total, errors, elapsed, (double)total / elapsed,
-           total ? lat / (double)total * 1e6 : 0.0);
-    free(th); free(res);
+           total ? lat / (double)total * 1e6 : 0.0, p50 * 1e6, p99 * 1e6, k);
+    free(all); free(th); free(res);
     return 0;
 }

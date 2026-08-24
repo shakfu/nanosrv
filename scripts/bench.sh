@@ -14,7 +14,35 @@ THREADS=4
 CONNECTIONS=100
 URL="http://127.0.0.1:${PORT}/"
 
+# Load generator. wrk is preferred when installed, but it is an external
+# dependency that the published numbers silently assumed; scripts/loadgen.c is
+# a bundled fallback so `make bench` works on a bare machine with only a C
+# compiler. Both are driven at the same connection count and duration.
+DURATION_SECS="${DURATION%s}"
+LOADGEN_BIN="build/loadgen"
+
+if command -v wrk >/dev/null 2>&1; then
+    LOAD_TOOL="wrk"
+else
+    LOAD_TOOL="loadgen"
+    if [ ! -x "$LOADGEN_BIN" ] || [ "${SCRIPT_DIR:-scripts}/loadgen.c" -nt "$LOADGEN_BIN" ]; then
+        mkdir -p build
+        echo "wrk not found -- building the bundled load generator ($LOADGEN_BIN)"
+        "${CC:-cc}" -O2 -D_GNU_SOURCE -o "$LOADGEN_BIN" \
+            "$(cd "$(dirname "$0")" && pwd)/loadgen.c" -lpthread
+    fi
+fi
+
 WRK="wrk -t${THREADS} -c${CONNECTIONS} -d${DURATION} --latency ${URL}"
+
+# Format microseconds the way wrk does, so both tools produce the same table.
+fmt_us() {
+    awk -v us="$1" 'BEGIN {
+        if (us >= 1000000) printf "%.2fs", us / 1000000
+        else if (us >= 1000) printf "%.2fms", us / 1000
+        else printf "%.2fus", us
+    }'
+}
 
 BUILD_DIR=build/cmake
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -66,11 +94,17 @@ run_one() {
     sleep 0.5
     wait_for_server
 
-    OUTPUT=$(${WRK} 2>&1) || true
-
-    _RPS=$(echo "$OUTPUT" | awk '/Requests\/sec/{print $2}')
-    _LAT=$(echo "$OUTPUT" | awk '/Thread Stats/{found=1} found && /Latency/{print $2; exit}')
-    _P99=$(echo "$OUTPUT" | awk '/99%/{print $2}')
+    if [ "$LOAD_TOOL" = "wrk" ]; then
+        OUTPUT=$(${WRK} 2>&1) || true
+        _RPS=$(echo "$OUTPUT" | awk '/Requests\/sec/{print $2}')
+        _LAT=$(echo "$OUTPUT" | awk '/Thread Stats/{found=1} found && /Latency/{print $2; exit}')
+        _P99=$(echo "$OUTPUT" | awk '/99%/{print $2}')
+    else
+        OUTPUT=$("$LOADGEN_BIN" 127.0.0.1 "$PORT" "$CONNECTIONS" "$DURATION_SECS" 2>&1) || true
+        _RPS=$(echo "$OUTPUT" | sed -n 's/.*"rps": \([0-9.]*\).*/\1/p')
+        _LAT=$(fmt_us "$(echo "$OUTPUT" | sed -n 's/.*"mean_latency_us": \([0-9.]*\).*/\1/p')")
+        _P99=$(fmt_us "$(echo "$OUTPUT" | sed -n 's/.*"p99_latency_us": \([0-9.]*\).*/\1/p')")
+    fi
 
     kill_server
 }
@@ -91,6 +125,8 @@ echo "  Duration:    ${DURATION}"
 echo "  Threads:     ${THREADS}"
 echo "  Connections: ${CONNECTIONS}"
 echo "  Port:        ${PORT}"
+echo "  Load tool:   ${LOAD_TOOL}"
+echo "  Handler:     identical across all servers (formats method + URI)"
 
 run_comparison() {
     local name="$1"; shift
@@ -121,6 +157,16 @@ run_comparison "nanosrv Python Manager (single-thread)" \
 
 run_comparison "nanosrv Python ShardedManager (multi-thread)" \
     uv run python "${SCRIPT_DIR}/bench_pynanosrv_sharded.py" "$PORT"
+
+# Optional 7th row: the same sharded Python server on a free-threaded
+# interpreter, where the Python handler parallelises instead of contending for
+# the GIL. Set NANOSRV_FT_PYTHON to a 3.13t+ interpreter that has nanosrv
+# installed (see scripts/bench_freethreading.py for a fuller sweep).
+FT_PYTHON="${NANOSRV_FT_PYTHON:-$(command -v python3.13t || true)}"
+if [ -n "$FT_PYTHON" ] && "$FT_PYTHON" -c "import nanosrv" >/dev/null 2>&1; then
+    run_comparison "nanosrv Python ShardedManager (free-threaded)" \
+        "$FT_PYTHON" "${SCRIPT_DIR}/bench_pynanosrv_sharded.py" "$PORT"
+fi
 
 # Terminal summary
 header "COMPARISON SUMMARY"
