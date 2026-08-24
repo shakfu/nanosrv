@@ -142,6 +142,91 @@ nice-to-have.
 
 ---
 
+## From REVIEW.md -- Phase 0 (done)
+
+The prerequisites identified in `REVIEW.md` section 7, all closed:
+
+- [x] **Licensing (4.1).** Relicensed GPL-2.0-only to match upstream Mongoose
+  (`GPL-2.0-only or commercial`, no "or later" clause), replacing the GPL-3.0
+  `LICENSE` and the `license = "MIT"` package metadata that PyPI was
+  publishing. Added `PROVENANCE.md` with a file-by-file account of what
+  descends from upstream, and removed the "rewritten from scratch" claim in
+  `projects/nanosrv/README.md`, which a line-level comparison against the
+  vendored upstream contradicts.
+
+- [x] **Binary payloads (4.2).** `HttpMessage.body` and `WsMessage.data` return
+  `bytes` (with `.text` for a strict UTF-8 decode); every send path accepts
+  bytes-like or str. Metadata stays `str` but decodes with `surrogateescape`,
+  so a malformed request cannot raise inside a handler. Uncovered and fixed a
+  latent truncation on the way: `http_reply()` formats its body through
+  `xprintf`'s `%s`, whose `scpy()` stops at the first NUL even with an explicit
+  precision -- hence the new length-counted `http_reply_bytes()`.
+
+- [x] **ShardedManager parity (4.3).** Added `http_listen_event()` (WebSocket
+  and every other event were unreachable on the sharded path), a routed
+  `wakeup()`, and `set_connect_timeout()`. Required making connection ids
+  unique across workers -- each worker numbered from 1 independently, so ids
+  collided -- via a per-worker id stride, which also makes `id % N` the routing
+  key. Fixed a second listener silently replacing the first listener's handler.
+
+- [x] **Streaming (4.4).** `start_chunked()`, `write_chunk()`, `start_sse()`,
+  `sse_send()` and `send_queue_len` exposed to Python, plus
+  `http_start_chunked()` / `http_start_sse()` in C++. Added `Connection.drain()`
+  after finding that `close()` discards unflushed output.
+
+## From REVIEW.md -- still open
+
+- [x] **Free-threading (4.5).** `nanobind_add_module()` now passes
+  `FREE_THREADED`, so the module keeps the GIL disabled on 3.13t; `cp313t`
+  wheels are in the release matrix and CI runs the suite on 3.13t. Measured
+  3.4x over the best GIL configuration with a ~100us pure-Python handler (3.5x
+  at ~400us), against a GIL build that gets slower with each added worker;
+  `scripts/bench_freethreading.py` reproduces it. Stress-tested for races on
+  3.13t (8 workers, HTTP + WebSocket + cross-thread wakeups, payload-verified,
+  zero errors). Two findings fell out, below.
+
+- [x] **Type stubs (4.6).** `scripts/gen_stubs.py` generates
+  `src/nanosrv/_core/*.pyi` (a stub *package*, because `_core` has a `json`
+  submodule that a single `.pyi` cannot resolve) and validates that they parse.
+  Payload parameters carry `nb::sig` annotations so they type as
+  `bytes | bytearray | memoryview | str` rather than `object`. The mypy
+  `ignore_missing_imports` override for `nanosrv._core` is gone.
+
+- [x] **`ShardedManager(1)` pathology on free-threaded CPython -- fixed, and it
+  was bigger than it looked.** The cause was as suspected: a worker is not a
+  Python thread, so each callback's `PyGILState_Ensure`/`Release` created and
+  destroyed a `PyThreadState`. `ShardedManager::set_worker_hooks()` now lets the
+  binding register each worker thread once, holding the GILState counter at one
+  for the thread's lifetime while leaving the thread detached between callbacks
+  (an attached thread parked in `epoll_wait` would stall a free-threaded
+  stop-the-world GC). This was not a free-threading quirk but the dominant
+  per-request cost on the sharded Python path in every release: trivial handler,
+  best worker count, 130K -> 350K req/s under the GIL and 126K -> 648K on 3.13t.
+  Covered by a C++ test (hooks fire once per worker, on distinct threads) and a
+  Python run/stop-cycle test.
+
+- [ ] **nanobind leak warnings at interpreter exit (4.6).** A module-level
+  `Manager` alive at shutdown prints "nanobind: leaked N instances!". Not a real
+  leak (it disappears if the objects are deleted first), but it is what every
+  user sees on their first Ctrl-C.
+
+- [ ] **DNS hardcoded to 8.8.8.8 (4.6).** `/etc/resolv.conf` is never consulted.
+
+- [ ] **`MG_MAX_RECV_SIZE` is a compile-time 3 MB cap (4.6).** A wheel user
+  cannot raise it at all.
+
+- [ ] **io_uring auto-detection (4.6).** Selected by
+  `__has_include(<liburing.h>)`, so the poller silently differs between build
+  machines; it is also poll-mode only, so it buys nothing over epoll.
+
+- [ ] **Benchmarks are macOS-only (4.6).** Not reproducible as published: `wrk`
+  is undocumented as a prerequisite and no Linux numbers exist. The sharded
+  design is justified by a macOS `SO_REUSEPORT` limitation that does not apply
+  on Linux, where per-worker `SO_REUSEPORT` listeners would avoid the
+  accept-and-hand-off tax.
+
+---
+
 ## Investigated and rejected -- do NOT re-litigate
 
 Preserved from the review so these are not re-flagged later. Each was checked

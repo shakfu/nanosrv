@@ -3,7 +3,7 @@ name = "nanosrv"
 version = "0.2.0"
 description = "An embedded server wrapped with nanobind"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "GPL-2.0-only" }
 authors = [
     { name = "Shakeeb Alireza", email = "shakfu@users.noreply.github.com" }
 ]
@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 keywords = ["nanobind", "python", "extension"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -45,12 +46,10 @@ sdist.exclude = []
 wheel.exclude = []
 
 [tool.mypy]
-# The public API is re-exported from the compiled nanobind extension
-# nanosrv._core, which ships no type stubs. The package itself is marked typed
-# (py.typed), so mypy flags the stubless extension as [import-untyped]; this
-# override silences that for the one C module without turning off type checking
-# for the rest of the package.
-[[tool.mypy.overrides]]
-module = "nanosrv._core"
-ignore_missing_imports = true
+# nanosrv._core (the compiled nanobind extension) now ships generated stubs in
+# src/nanosrv/_core.pyi, so the Typing :: Typed classifier is backed by real
+# signatures and the previous ignore_missing_imports override for that module
+# is gone. Regenerate the stubs after changing the bindings with:
+#   uv run --with nanobind python -m nanobind.stubgen -m nanosrv._core \
+#       -o src/nanosrv/_core.pyi
 

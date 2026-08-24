@@ -29,7 +29,14 @@ permissions:
   contents: read
 
 env:
-  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+  # cp313t is the free-threaded (no-GIL) build. It is where ShardedManager
+  # stops losing to Manager: with a pure-Python handler it scales across
+  # workers instead of contending for the GIL (see the free-threading section
+  # of the README). The module opts in via nanobind's FREE_THREADED flag in
+  # CMakeLists.txt; without a wheel for it, users cannot get that build.
+  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp313t-*"
+  # cibuildwheel does not build free-threaded interpreters unless enabled.
+  CIBW_ENABLE: "cpython-freethreading"
   CIBW_SKIP: "*-musllinux_* pp*"
   CIBW_TEST_REQUIRES: pytest
   CIBW_TEST_COMMAND: pytest {project}/tests -v

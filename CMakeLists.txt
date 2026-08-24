@@ -22,7 +22,13 @@ add_subdirectory(projects/nanosrv)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(nanobind CONFIG REQUIRED)
 
-nanobind_add_module(_core src/nanosrv/_core.cpp)
+# FREE_THREADED opts the module into free-threaded CPython (3.13t and later):
+# without it, nanobind omits the Py_mod_gil / Py_MOD_GIL_NOT_USED slot and
+# importing the module re-enables the GIL process-wide -- which would defeat
+# ShardedManager on exactly the interpreter where it stops losing to Manager.
+# nanobind ignores the flag on a GIL interpreter (nanobind-config.cmake sets
+# ARG_FREE_THREADED FALSE there), so this is safe for every build.
+nanobind_add_module(_core FREE_THREADED src/nanosrv/_core.cpp)
 target_link_libraries(_core PRIVATE nanosrv)
 
 if(MSVC)

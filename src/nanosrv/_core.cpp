@@ -105,42 +105,268 @@ struct PyWsMsg {
 };
 
 // ---------------------------------------------------------------------------
+// Per-worker-thread Python state
+// ---------------------------------------------------------------------------
+//
+// A ShardedManager worker is a plain C++ thread, unknown to CPython. Every
+// callback therefore did PyGILState_Ensure()/Release(), and because the
+// GILState counter fell back to zero each time, CPython *created and destroyed
+// a PyThreadState per request*. Under the GIL that costs a few microseconds;
+// on a free-threaded interpreter it was catastrophic -- around 185us per
+// request with one worker, against ~3us on a GIL build.
+//
+// Instead, register the thread once when it starts and keep its thread state
+// alive for the thread's lifetime, holding the GILState counter at one so no
+// per-request Release can destroy it. The thread is left *detached* between
+// callbacks (PyEval_SaveThread), which matters: an attached thread parked in
+// epoll_wait would never reach a safe point, and a free-threaded
+// stop-the-world GC would wait on it forever. Each callback's
+// gil_scoped_acquire then only attaches an existing state rather than building
+// a new one.
+static thread_local PyGILState_STATE tl_gilstate;
+static thread_local PyThreadState* tl_saved = nullptr;
+static thread_local bool tl_registered = false;
+
+static void worker_thread_start()
+{
+    if (tl_registered)
+        return;
+    tl_gilstate = PyGILState_Ensure();  // creates this thread's PyThreadState
+    tl_saved = PyEval_SaveThread();     // detach it, but keep it alive
+    tl_registered = true;
+}
+
+static void worker_thread_stop()
+{
+    if (!tl_registered)
+        return;
+    PyEval_RestoreThread(tl_saved);     // re-attach to balance the SaveThread
+    PyGILState_Release(tl_gilstate);    // counter reaches 0: state destroyed
+    tl_saved = nullptr;
+    tl_registered = false;
+}
+
+// ---------------------------------------------------------------------------
+// Payload interop: bytes in, bytes out
+// ---------------------------------------------------------------------------
+//
+// Wire payloads are bytes, not text. These previously crossed the boundary as
+// std::string / std::string_view, which nanobind maps to `str` with strict
+// UTF-8 -- so a binary request body or a binary WebSocket frame raised
+// UnicodeDecodeError inside the handler, and every send path rejected `bytes`
+// outright (including the method named send_bytes).
+//
+// Now: payload-carrying properties return `bytes`, with a `.text` companion
+// that decodes strictly and raises where that is the caller's explicit choice.
+// Every send accepts bytes, bytearray, memoryview or str (str is encoded
+// UTF-8).
+//
+// Protocol metadata that is textual by definition (method, URI, query, header
+// values) stays `str`, but is decoded with `surrogateescape` rather than
+// strictly: a malformed request must not raise inside a handler. Invalid bytes
+// survive as lone surrogates and round-trip out again with
+// s.encode("utf-8", "surrogateescape").
+
+static nb::bytes to_bytes(std::string_view s)
+{
+    return nb::bytes(s.empty() ? "" : s.data(), s.size());
+}
+
+static nb::object decode(std::string_view s, const char* errors)
+{
+    if (s.empty())
+        return nb::str("");
+    PyObject* o = PyUnicode_DecodeUTF8(s.data(),
+                                       static_cast<Py_ssize_t>(s.size()),
+                                       errors);
+    if (o == nullptr)
+        throw nb::python_error();
+    return nb::steal(o);
+}
+
+// Lenient: never raises. For protocol metadata handed to a handler.
+static nb::object to_text(std::string_view s) { return decode(s, "surrogateescape"); }
+
+// Strict: raises UnicodeDecodeError. For .text, where the caller asked for text.
+static nb::object to_text_strict(std::string_view s) { return decode(s, "strict"); }
+
+// Borrowed, zero-copy view over a bytes-like or str argument. Valid while the
+// Python argument is alive, which for a function parameter is the whole call.
+class Payload {
+public:
+    explicit Payload(nb::handle h)
+    {
+        PyObject* o = h.ptr();
+        if (o == nullptr || o == Py_None) {
+            return;  // treat None as empty, so headers=None is not a footgun
+        }
+        if (PyUnicode_Check(o)) {
+            Py_ssize_t n = 0;
+            const char* p = PyUnicode_AsUTF8AndSize(o, &n);
+            if (p != nullptr) {
+                view_ = std::string_view(p, static_cast<size_t>(n));
+                return;
+            }
+            // Lone surrogates (e.g. a string that came back out of to_text):
+            // re-encode losslessly instead of failing.
+            PyErr_Clear();
+            PyObject* b = PyUnicode_AsEncodedString(o, "utf-8", "surrogateescape");
+            if (b == nullptr)
+                throw nb::python_error();
+            tmp_.assign(PyBytes_AsString(b), static_cast<size_t>(PyBytes_Size(b)));
+            Py_DECREF(b);
+            view_ = tmp_;
+            return;
+        }
+        if (PyObject_CheckBuffer(o)
+            && PyObject_GetBuffer(o, &buf_, PyBUF_SIMPLE) == 0) {
+            has_buf_ = true;
+            view_ = std::string_view(static_cast<const char*>(buf_.buf),
+                                     static_cast<size_t>(buf_.len));
+            return;
+        }
+        PyErr_Clear();
+        throw nb::type_error(
+            "expected bytes, bytearray, memoryview or str");
+    }
+
+    ~Payload()
+    {
+        if (has_buf_)
+            PyBuffer_Release(&buf_);
+    }
+
+    Payload(const Payload&) = delete;
+    Payload& operator=(const Payload&) = delete;
+
+    std::string_view view() const { return view_; }
+    // NUL-terminated copy, for the C APIs that take a const char*.
+    std::string str() const { return std::string(view_); }
+
+private:
+    Py_buffer buf_{};
+    bool has_buf_ = false;
+    std::string tmp_;
+    std::string_view view_;
+};
+
+// ---------------------------------------------------------------------------
 // Thin wrappers where the C++ API uses varargs or needs argument adaptation
 // ---------------------------------------------------------------------------
 
-static void py_http_reply(PyConn& c, int status, const std::string& headers,
-                          const std::string& body)
+// http_reply_bytes(), not http_reply(): the formatted variant runs the body
+// through xprintf's "%s", which stops at the first NUL byte even with an
+// explicit precision, so it silently truncates any binary payload.
+static void py_http_reply(PyConn& c, int status, nb::handle headers,
+                          nb::handle body)
 {
-    nanosrv::http_reply(c.get(), status, headers.c_str(), "%.*s",
-                        static_cast<int>(body.size()), body.data());
+    auto* conn = c.get();
+    std::string hdr = Payload(headers).str();
+    Payload b(body);
+    nanosrv::http_reply_bytes(conn, status, hdr.c_str(), b.view().data(),
+                              b.view().size());
 }
 
 static void py_http_reply_ref(nanosrv::ConnectionRef& ref, int status,
-                              const std::string& headers,
-                              const std::string& body)
+                              nb::handle headers, nb::handle body)
 {
-    nanosrv::http_reply(&*ref, status, headers.c_str(), "%.*s",
-                        static_cast<int>(body.size()), body.data());
+    std::string hdr = Payload(headers).str();
+    Payload b(body);
+    nanosrv::http_reply_bytes(&*ref, status, hdr.c_str(), b.view().data(),
+                              b.view().size());
 }
 
-static size_t py_ws_send_text(PyConn& c, const std::string& data)
+static size_t py_ws_send_text(PyConn& c, nb::handle data)
 {
-    return nanosrv::ws_send(c.get(), data.data(), data.size(), WEBSOCKET_OP_TEXT);
+    auto* conn = c.get();
+    Payload p(data);
+    return nanosrv::ws_send(conn, p.view().data(), p.view().size(),
+                            WEBSOCKET_OP_TEXT);
 }
 
-static size_t py_ws_send_binary(PyConn& c, nb::bytes data)
+static size_t py_ws_send_binary(PyConn& c, nb::handle data)
 {
-    return nanosrv::ws_send(c.get(), data.c_str(), data.size(), WEBSOCKET_OP_BINARY);
+    auto* conn = c.get();
+    Payload p(data);
+    return nanosrv::ws_send(conn, p.view().data(), p.view().size(),
+                            WEBSOCKET_OP_BINARY);
 }
 
-static size_t py_ws_send_op(PyConn& c, nb::bytes data, int op)
+static size_t py_ws_send_op(PyConn& c, nb::handle data, int op)
 {
-    return nanosrv::ws_send(c.get(), data.c_str(), data.size(), op);
+    auto* conn = c.get();
+    Payload p(data);
+    return nanosrv::ws_send(conn, p.view().data(), p.view().size(), op);
 }
 
-static void py_ws_upgrade(PyConn& c, PyHttpMsg& hm, const std::string& headers)
+static void py_ws_upgrade(PyConn& c, PyHttpMsg& hm, nb::handle headers)
 {
-    nanosrv::ws_upgrade(c.get(), hm.get(), "%s", headers.c_str());
+    auto* conn = c.get();
+    auto* msg = hm.get();
+    std::string hdr = Payload(headers).str();
+    // "%s" (not hdr.c_str() as the format) so a header value containing a
+    // percent sign cannot be interpreted as a conversion.
+    nanosrv::ws_upgrade(conn, msg, "%s", hdr.c_str());
+}
+
+// --- streamed responses ----------------------------------------------------
+//
+// The chunked-write primitives existed in C++ (http_write_chunk) but were not
+// exposed, so a Python handler had to materialise its entire response body as
+// one object before replying. These make incremental responses -- SSE feeds,
+// long downloads, token streams -- possible from Python.
+
+static void py_start_chunked(PyConn& c, int status, nb::handle headers)
+{
+    auto* conn = c.get();
+    std::string hdr = Payload(headers).str();
+    nanosrv::http_start_chunked(conn, status, hdr.c_str());
+}
+
+static void py_start_sse(PyConn& c, nb::handle headers)
+{
+    auto* conn = c.get();
+    std::string hdr = Payload(headers).str();
+    nanosrv::http_start_sse(conn, hdr.c_str());
+}
+
+static void py_write_chunk(PyConn& c, nb::handle data)
+{
+    auto* conn = c.get();
+    Payload p(data);
+    nanosrv::http_write_chunk(conn, p.view().data(), p.view().size());
+}
+
+// One SSE event, emitted as a single chunk. Multi-line payloads are split into
+// one `data:` line each, as the format requires; a bare newline terminates.
+static void py_sse_send(PyConn& c, nb::handle data, nb::handle event,
+                        nb::handle id, nb::handle retry)
+{
+    auto* conn = c.get();
+    std::string frame;
+    if (!event.is_none())
+        frame += "event: " + Payload(event).str() + "\n";
+    if (!id.is_none())
+        frame += "id: " + Payload(id).str() + "\n";
+    if (!retry.is_none())
+        frame += "retry: " + std::to_string(nb::cast<long>(retry)) + "\n";
+
+    std::string_view body = Payload(data).view();
+    size_t pos = 0;
+    do {
+        size_t nl = body.find('\n', pos);
+        std::string_view line = body.substr(
+            pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        frame += "data: ";
+        frame.append(line);
+        frame += "\n";
+        pos = (nl == std::string_view::npos) ? nl : nl + 1;
+    } while (pos != std::string_view::npos);
+    frame += "\n";
+
+    nanosrv::http_write_chunk(conn, frame.data(), frame.size());
 }
 
 // Reject TLS URLs up front with a clear Python exception when this build has no
@@ -153,9 +379,17 @@ static void require_tls_available(std::string_view url)
             "not supported. Use http:// or ws://, or check nanosrv.tls_available().");
 }
 
-static bool py_conn_send_bytes(PyConn& c, std::string_view data)
+static bool py_conn_send_bytes(PyConn& c, nb::handle data)
 {
-    return c.get()->send_bytes(data);
+    auto* conn = c.get();
+    Payload p(data);
+    return conn->send_bytes(p.view());
+}
+
+static bool py_ref_send_bytes(nanosrv::ConnectionRef& ref, nb::handle data)
+{
+    Payload p(data);
+    return ref.send_bytes(p.view());
 }
 
 // ---------------------------------------------------------------------------
@@ -195,12 +429,18 @@ NB_MODULE(_core, m) {
         .value("Ping", WsOpcode::Ping)
         .value("Pong", WsOpcode::Pong);
 
-    nb::enum_<nanosrv::LogLevel>(m, "LogLevel")
-        .value("None", nanosrv::LogLevel::None)
+    // "Off", not "None": a member literally named None cannot be written as
+    // LogLevel.None in Python (it is a keyword -- the expression is a
+    // SyntaxError), so the level was reachable only through
+    // getattr(LogLevel, "None"), and no type stub could name it either. The old
+    // name is kept as an alias so existing getattr() call sites keep working.
+    auto log_level = nb::enum_<nanosrv::LogLevel>(m, "LogLevel")
+        .value("Off", nanosrv::LogLevel::None)
         .value("Error", nanosrv::LogLevel::Error)
         .value("Info", nanosrv::LogLevel::Info)
         .value("Debug", nanosrv::LogLevel::Debug)
         .value("Verbose", nanosrv::LogLevel::Verbose);
+    log_level.attr("None") = log_level.attr("Off");
 
     // -----------------------------------------------------------------------
     // Url
@@ -224,27 +464,37 @@ NB_MODULE(_core, m) {
     // -----------------------------------------------------------------------
     nb::class_<PyHttpMsg>(m, "HttpMessage")
         .def_prop_ro("method", [](const PyHttpMsg& m) {
-            return m.get()->method_str();
-        })
+            return to_text(m.get()->method_str());
+        }, "Request method as str (surrogateescape-decoded; never raises).")
         .def_prop_ro("uri", [](const PyHttpMsg& m) {
-            return m.get()->uri_str();
-        })
+            return to_text(m.get()->uri_str());
+        }, "Request URI as str (surrogateescape-decoded; never raises).")
         .def_prop_ro("query", [](const PyHttpMsg& m) {
-            return m.get()->query_str();
-        })
+            return to_text(m.get()->query_str());
+        }, "Query string as str (surrogateescape-decoded; never raises).")
         .def_prop_ro("body", [](const PyHttpMsg& m) {
-            return m.get()->body_str();
-        })
+            return to_bytes(m.get()->body_str());
+        }, "Request body as bytes. Use .text for a UTF-8 decoded str.")
+        .def_prop_ro("text", [](const PyHttpMsg& m) {
+            return to_text_strict(m.get()->body_str());
+        }, nb::sig("def text(self) -> str"),
+           "Request body decoded strictly as UTF-8. Raises UnicodeDecodeError "
+           "on binary input -- use .body when the payload may not be text.")
         .def_prop_ro("status_code", [](const PyHttpMsg& m) {
             return m.get()->status_code();
         })
-        .def("header", [](const PyHttpMsg& m, const char* name) {
-            return m.get()->header(name);
-        }, "name"_a,
-           "Return the value of an HTTP header, or None if not present.")
+        .def("header", [](const PyHttpMsg& m, const char* name) -> nb::object {
+            auto v = m.get()->header(name);
+            if (!v)
+                return nb::none();
+            return to_text(*v);
+        }, "name"_a, nb::sig("def header(self, name: str) -> str | None"),
+           "Return the value of an HTTP header as str, or None if not present.")
         .def("credentials", [](const PyHttpMsg& m) {
-            return m.get()->credentials();
-        }, "Return (user, password) from Authorization header.")
+            auto [user, pass] = m.get()->credentials();
+            return nb::make_tuple(to_text(user), to_text(pass));
+        }, nb::sig("def credentials(self) -> tuple[str, str]"),
+           "Return (user, password) from Authorization header.")
         .def("__repr__", [](const PyHttpMsg& m) {
             auto* hm = m.get();
             return std::string("HttpMessage(method='") +
@@ -259,8 +509,15 @@ NB_MODULE(_core, m) {
     nb::class_<PyWsMsg>(m, "WsMessage")
         .def_prop_ro("data", [](const PyWsMsg& m) {
             auto* wm = m.get();
-            return std::string_view(wm->data.buf, wm->data.len);
-        })
+            return to_bytes(std::string_view(wm->data.buf, wm->data.len));
+        }, "Frame payload as bytes -- binary frames included. Use .text for a "
+           "UTF-8 decoded str.")
+        .def_prop_ro("text", [](const PyWsMsg& m) {
+            auto* wm = m.get();
+            return to_text_strict(std::string_view(wm->data.buf, wm->data.len));
+        }, nb::sig("def text(self) -> str"),
+           "Frame payload decoded strictly as UTF-8. Raises "
+           "UnicodeDecodeError on a binary frame.")
         .def_prop_ro("flags", [](const PyWsMsg& m) -> int {
             return m.get()->flags;
         })
@@ -295,20 +552,63 @@ NB_MODULE(_core, m) {
         .def_prop_ro("is_closing", [](const PyConn& c) {
             return static_cast<bool>(c.get()->is_closing);
         })
+        .def_prop_ro("send_queue_len", [](const PyConn& c) {
+            return c.get()->send.len;
+        }, "Bytes buffered for sending but not yet written to the socket. "
+           "Watch this to apply backpressure when producing a stream faster "
+           "than the peer reads it; set_max_send_buffer() is the hard limit.")
         .def("send_bytes", &py_conn_send_bytes, "data"_a,
-             "Send raw bytes on the connection.")
+             nb::sig("def send_bytes(self, data: bytes | bytearray | memoryview | str) -> bool"),
+             "Send raw bytes on the connection. Accepts bytes, bytearray, "
+             "memoryview or str (encoded UTF-8).")
         .def("close", [](PyConn& c) { c.get()->set_closing(); },
-             "Mark the connection for closing.")
+             "Close the connection immediately, discarding anything still "
+             "buffered for sending. To close after the response has been "
+             "flushed, use drain().")
+        .def("drain", [](PyConn& c) { c.get()->is_draining = 1; },
+             "Close the connection once everything buffered has been written. "
+             "This is what you want after send_bytes() or a streamed "
+             "response -- close() would drop the unsent tail.")
         .def("http_reply", &py_http_reply,
-             "status"_a, "headers"_a = "", "body"_a = "",
-             "Send an HTTP response.")
+             "status"_a, "headers"_a = nb::str(""), "body"_a = nb::bytes("", 0),
+             nb::sig("def http_reply(self, status: int, headers: bytes | bytearray | memoryview | str = '', "
+                     "body: bytes | bytearray | memoryview | str = b'') -> None"),
+             "Send a complete HTTP response. body accepts bytes, bytearray, "
+             "memoryview or str (encoded UTF-8).")
+        .def("start_chunked", &py_start_chunked,
+             "status"_a = 200, "headers"_a = nb::str(""),
+             nb::sig("def start_chunked(self, status: int = 200, "
+                     "headers: bytes | bytearray | memoryview | str = '') -> None"),
+             "Begin a chunked response: sends the status line, your headers, "
+             "and Transfer-Encoding: chunked. Follow with write_chunk() per "
+             "piece and write_chunk(b'') to finish.")
+        .def("start_sse", &py_start_sse, "headers"_a = nb::str(""),
+             nb::sig("def start_sse(self, headers: bytes | bytearray | memoryview | str = '') -> None"),
+             "Begin a Server-Sent Events stream (text/event-stream, no-cache, "
+             "chunked). Follow with sse_send() per event.")
+        .def("write_chunk", &py_write_chunk, "data"_a,
+             nb::sig("def write_chunk(self, data: bytes | bytearray | memoryview | str) -> None"),
+             "Write one chunk of a chunked response. An empty payload emits "
+             "the terminating chunk and completes the response.")
+        .def("sse_send", &py_sse_send,
+             "data"_a, "event"_a = nb::none(), "id"_a = nb::none(),
+             "retry"_a = nb::none(),
+             nb::sig("def sse_send(self, data: bytes | bytearray | memoryview | str, event: str | None = None, "
+                     "id: str | None = None, retry: int | None = None) -> None"),
+             "Send one SSE event. Multi-line data is split into one data: "
+             "line per line, as the format requires.")
         .def("ws_send_text", &py_ws_send_text, "data"_a,
-             "Send a WebSocket text frame.")
+             nb::sig("def ws_send_text(self, data: bytes | bytearray | memoryview | str) -> int"),
+             "Send a WebSocket text frame. Accepts str or bytes-like.")
         .def("ws_send_binary", &py_ws_send_binary, "data"_a,
-             "Send a WebSocket binary frame.")
+             nb::sig("def ws_send_binary(self, data: bytes | bytearray | memoryview | str) -> int"),
+             "Send a WebSocket binary frame. Accepts bytes-like or str.")
         .def("ws_send", &py_ws_send_op, "data"_a, "opcode"_a,
+             nb::sig("def ws_send(self, data: bytes | bytearray | memoryview | str, opcode: int) -> int"),
              "Send a WebSocket frame with explicit opcode.")
-        .def("ws_upgrade", &py_ws_upgrade, "hm"_a, "headers"_a = "",
+        .def("ws_upgrade", &py_ws_upgrade, "hm"_a, "headers"_a = nb::str(""),
+             nb::sig("def ws_upgrade(self, hm: HttpMessage, "
+                     "headers: bytes | bytearray | memoryview | str = '') -> None"),
              "Upgrade an HTTP connection to WebSocket.");
 
     // -----------------------------------------------------------------------
@@ -319,10 +619,15 @@ NB_MODULE(_core, m) {
         .def("__bool__", [](const nanosrv::ConnectionRef& r) {
             return static_cast<bool>(r);
         })
-        .def("send_bytes", &nanosrv::ConnectionRef::send_bytes, "data"_a)
+        .def("send_bytes", &py_ref_send_bytes, "data"_a,
+             nb::sig("def send_bytes(self, data: bytes | bytearray | memoryview | str) -> bool"),
+             "Send raw bytes. Accepts bytes, bytearray, memoryview or str.")
         .def("close", &nanosrv::ConnectionRef::set_closing)
         .def("http_reply", &py_http_reply_ref,
-             "status"_a, "headers"_a = "", "body"_a = "");
+             "status"_a, "headers"_a = nb::str(""),
+             "body"_a = nb::bytes("", 0),
+             nb::sig("def http_reply(self, status: int, headers: bytes | bytearray | memoryview | str = '', "
+                     "body: bytes | bytearray | memoryview | str = b'') -> None"));
 
     // -----------------------------------------------------------------------
     // Metrics snapshot (observability)
@@ -418,6 +723,15 @@ NB_MODULE(_core, m) {
                                        PyWsMsg{
                                            static_cast<nanosrv::WsMessage*>(ev_data),
                                            alive});
+                             } else if (ev == nanosrv::Event::Wakeup) {
+                                 // The wakeup payload was previously dropped,
+                                 // which made wakeup() a bare signal. Hand it
+                                 // over as bytes; it is copied out of the pipe
+                                 // buffer, so it outlives the callback.
+                                 auto* d = static_cast<nanosrv::Str*>(ev_data);
+                                 (*cb)(PyConn{&c, alive}, ev,
+                                       to_bytes(std::string_view(
+                                           d->buf, d->len)));
                              } else {
                                  (*cb)(PyConn{&c, alive}, ev, nb::none());
                              }
@@ -431,9 +745,17 @@ NB_MODULE(_core, m) {
              "url"_a, "handler"_a, nb::keep_alive<0, 1>(),
              "Listen with full event handler. handler(conn, event, data) is "
              "called for every event.")
-        .def("wakeup", &nanosrv::Manager::wakeup,
-             "conn_id"_a, "data"_a = std::string_view{},
-             "Wakeup a connection by ID.")
+        .def("wakeup", [](nanosrv::Manager& mgr, unsigned long conn_id,
+                          nb::handle data) {
+            Payload p(data);
+            return mgr.wakeup(conn_id, p.view());
+        }, "conn_id"_a, "data"_a = nb::bytes("", 0),
+           nb::sig("def wakeup(self, conn_id: int, data: bytes | bytearray | memoryview | str = b'') -> bool"),
+           "Deliver Event.Wakeup with `data` to the connection with this id, "
+           "from any thread. This is how you push to a connection outside its "
+           "handler -- a stored Connection is invalid once the handler "
+           "returns. Requires an http_listen_event() handler to observe it. "
+           "Returns False if the id is unknown or the wakeup pipe is down.")
         .def("set_idle_timeout", &nanosrv::Manager::set_idle_timeout, "ms"_a,
              "Close accepted connections idle (no I/O) for `ms` milliseconds. "
              "0 disables (the default). Also reaps idle WebSockets, so use "
@@ -483,7 +805,14 @@ NB_MODULE(_core, m) {
     // ShardedManager (multi-threaded event loop)
     // -----------------------------------------------------------------------
     nb::class_<nanosrv::ShardedManager>(m, "ShardedManager")
-        .def(nb::init<unsigned>(), "num_threads"_a = 0,
+        .def("__init__",
+             [](nanosrv::ShardedManager* self, unsigned num_threads) {
+                 new (self) nanosrv::ShardedManager(num_threads);
+                 // Register each worker thread with CPython once, rather than
+                 // once per request (see worker_thread_start above).
+                 self->set_worker_hooks(worker_thread_start, worker_thread_stop);
+             },
+             "num_threads"_a = 0,
              "Create a sharded manager. 0 = use hardware concurrency.")
         .def("http_listen",
              [](nanosrv::ShardedManager& mgr, std::string_view url,
@@ -504,7 +833,65 @@ NB_MODULE(_core, m) {
                      };
                  mgr.http_listen(url, std::move(handler));
              },
-             "url"_a, "handler"_a, nb::keep_alive<0, 1>())
+             "url"_a, "handler"_a, nb::keep_alive<0, 1>(),
+             "Listen for HTTP connections. handler(conn, msg) runs on the "
+             "worker thread owning the connection.")
+        .def("http_listen_event",
+             [](nanosrv::ShardedManager& mgr, std::string_view url,
+                nb::object callback) {
+                 require_tls_available(url);
+                 auto cb = make_callback(std::move(callback));
+
+                 HandlerFn handler =
+                     [cb](nanosrv::Connection& c, nanosrv::Event ev,
+                          void* ev_data) {
+                         nb::gil_scoped_acquire acquire;
+                         auto alive = std::make_shared<bool>(true);
+                         try {
+                             if (ev == nanosrv::Event::HttpMessage ||
+                                 ev == nanosrv::Event::WsOpen) {
+                                 (*cb)(PyConn{&c, alive}, ev,
+                                       PyHttpMsg{
+                                           static_cast<nanosrv::HttpMessage*>(ev_data),
+                                           alive});
+                             } else if (ev == nanosrv::Event::WsMessage) {
+                                 (*cb)(PyConn{&c, alive}, ev,
+                                       PyWsMsg{
+                                           static_cast<nanosrv::WsMessage*>(ev_data),
+                                           alive});
+                             } else if (ev == nanosrv::Event::Wakeup) {
+                                 auto* d = static_cast<nanosrv::Str*>(ev_data);
+                                 (*cb)(PyConn{&c, alive}, ev,
+                                       to_bytes(std::string_view(d->buf, d->len)));
+                             } else {
+                                 (*cb)(PyConn{&c, alive}, ev, nb::none());
+                             }
+                         } catch (nb::python_error& e) {
+                             e.restore();
+                         }
+                         *alive = false;
+                     };
+                 mgr.http_listen_event(url, std::move(handler));
+             },
+             "url"_a, "handler"_a, nb::keep_alive<0, 1>(),
+             "Listen with a full event handler, so WebSocket works on the "
+             "sharded path -- http_listen() only ever delivers HttpMessage. "
+             "handler(conn, event, data) runs on the worker thread owning the "
+             "connection, so it must be thread-safe.")
+        .def("wakeup", [](nanosrv::ShardedManager& mgr, unsigned long conn_id,
+                          nb::handle data) {
+            Payload p(data);
+            return mgr.wakeup(conn_id, p.view());
+        }, "conn_id"_a, "data"_a = nb::bytes("", 0),
+           nb::sig("def wakeup(self, conn_id: int, data: bytes | bytearray | memoryview | str = b'') -> bool"),
+           "Deliver Event.Wakeup with `data` to the connection with this id, "
+           "on whichever worker owns it. Thread-safe. Only meaningful between "
+           "run() and its return; returns False otherwise, or if no worker "
+           "owns the id.")
+        .def("set_connect_timeout",
+             &nanosrv::ShardedManager::set_connect_timeout, "ms"_a,
+             "Connect deadline (ms) for client-initiated connections on every "
+             "worker. Set before run().")
         .def("run", [](nanosrv::ShardedManager& mgr) {
             nb::gil_scoped_release release;
             mgr.run();
@@ -553,32 +940,70 @@ NB_MODULE(_core, m) {
     // Utility functions
     // -----------------------------------------------------------------------
 
-    // Base64
-    m.def("base64_encode",
-          nb::overload_cast<std::string_view>(&nanosrv::base64_encode),
-          "input"_a, "Base64-encode a string.");
-    m.def("base64_decode",
-          nb::overload_cast<std::string_view>(&nanosrv::base64_decode),
-          "input"_a, "Base64-decode a string.");
+    // Base64. Encoding accepts arbitrary bytes; decoding produces arbitrary
+    // bytes, so it returns `bytes` (as Python's own base64 module does) --
+    // returning str made b64 of any non-UTF-8 payload undecodable.
+    m.def("base64_encode", [](nb::handle input) {
+        Payload p(input);
+        return nanosrv::base64_encode(p.view());
+    }, "input"_a, nb::sig("def base64_encode(input: bytes | bytearray | memoryview | str) -> str"),
+       "Base64-encode bytes or str (str is encoded UTF-8). Returns str.");
+    m.def("base64_decode", [](nb::handle input) {
+        Payload p(input);
+        return to_bytes(nanosrv::base64_decode(p.view()));
+    }, "input"_a, nb::sig("def base64_decode(input: bytes | bytearray | memoryview | str) -> bytes"),
+       "Base64-decode. Returns bytes.");
 
     // URL encode/decode
-    m.def("url_encode",
-          nb::overload_cast<std::string_view>(&nanosrv::url_encode),
-          "input"_a, "URL-encode a string.");
-    m.def("url_decode",
-          nb::overload_cast<std::string_view>(&nanosrv::url_decode),
-          "input"_a, "URL-decode a string.");
+    m.def("url_encode", [](nb::handle input) {
+        Payload p(input);
+        return nanosrv::url_encode(p.view());
+    }, "input"_a, nb::sig("def url_encode(input: bytes | bytearray | memoryview | str) -> str"),
+       "Percent-encode bytes or str (str is encoded UTF-8). Returns str.");
+    m.def("url_decode", [](nb::handle input) {
+        Payload p(input);
+        return to_text(nanosrv::url_decode(p.view()));
+    }, "input"_a, nb::sig("def url_decode(input: bytes | bytearray | memoryview | str) -> str"),
+       "Percent-decode. Returns str, decoded with surrogateescape so a "
+       "sequence that is not valid UTF-8 does not raise; recover the raw "
+       "bytes with s.encode('utf-8', 'surrogateescape').");
+    m.def("url_decode_bytes", [](nb::handle input) {
+        Payload p(input);
+        return to_bytes(nanosrv::url_decode(p.view()));
+    }, "input"_a, nb::sig("def url_decode_bytes(input: bytes | bytearray | memoryview | str) -> bytes"),
+       "Percent-decode. Returns the decoded bytes verbatim.");
 
     // JSON (nanosrv::json namespace)
+    // Each accepts bytes or str, so a request body (now bytes) can be parsed
+    // without a decode step.
     auto json_mod = m.def_submodule("json", "JSON parsing utilities");
-    json_mod.def("number", &nanosrv::json::number, "json"_a, "path"_a,
-                 "Extract a number from JSON at the given path.");
-    json_mod.def("boolean", &nanosrv::json::boolean, "json"_a, "path"_a,
-                 "Extract a boolean from JSON at the given path.");
-    json_mod.def("integer", &nanosrv::json::integer, "json"_a, "path"_a,
-                 "Extract an integer from JSON at the given path.");
-    json_mod.def("string", &nanosrv::json::string, "json"_a, "path"_a,
-                 "Extract a string from JSON at the given path.");
+    json_mod.def("number", [](nb::handle json, const char* path) {
+        Payload p(json);
+        return nanosrv::json::number(p.view(), path);
+    }, "json"_a, "path"_a,
+       nb::sig("def number(json: bytes | bytearray | memoryview | str, path: str) -> float | None"),
+       "Extract a number from JSON at the given path.");
+    json_mod.def("boolean", [](nb::handle json, const char* path) {
+        Payload p(json);
+        return nanosrv::json::boolean(p.view(), path);
+    }, "json"_a, "path"_a,
+       nb::sig("def boolean(json: bytes | bytearray | memoryview | str, path: str) -> bool | None"),
+       "Extract a boolean from JSON at the given path.");
+    json_mod.def("integer", [](nb::handle json, const char* path) {
+        Payload p(json);
+        return nanosrv::json::integer(p.view(), path);
+    }, "json"_a, "path"_a,
+       nb::sig("def integer(json: bytes | bytearray | memoryview | str, path: str) -> int | None"),
+       "Extract an integer from JSON at the given path.");
+    json_mod.def("string", [](nb::handle json, const char* path) -> nb::object {
+        Payload p(json);
+        auto v = nanosrv::json::string(p.view(), path);
+        if (!v)
+            return nb::none();
+        return to_text(*v);
+    }, "json"_a, "path"_a,
+       nb::sig("def string(json: bytes | bytearray | memoryview | str, path: str) -> str | None"),
+       "Extract a string from JSON at the given path.");
 
     // URL parsing
     // (Url class already registered above with Url.parse static method)

@@ -181,7 +181,12 @@ struct Connection* alloc_conn(struct Mgr* mgr)
 
     c->mgr = mgr;
     c->send.align = c->recv.align = c->rtls.align = MG_IO_SIZE;
-    c->id = ++mgr->nextid;
+    // id_stride is 1 for a standalone Manager (ids 1, 2, 3, ...). A
+    // ShardedManager seeds worker i with nextid = i and id_stride = N, so ids
+    // are unique across workers and `id % N` recovers the owning worker --
+    // which is what makes ShardedManager::wakeup() routable.
+    mgr->nextid += mgr->id_stride;
+    c->id = mgr->nextid;
     c->last_active = millis();  // start the idle clock at creation
     MG_PROF_INIT(c);
     return c;
@@ -390,6 +395,7 @@ void mgr_init(struct Mgr* mgr)
     signal(SIGPIPE, SIG_IGN);
 #endif
     mgr->pipe = MG_INVALID_SOCKET;
+    mgr->id_stride = 1;  // see Mgr::id_stride; ShardedManager overrides this
     mgr->dnstimeout = MG_DEFAULT_DNS_TIMEOUT_MS;
     mgr->connect_timeout_ms = MG_DEFAULT_CONNECT_TIMEOUT_MS;
     mgr->dns4.url = MG_DEFAULT_DNS4_URL;
@@ -455,9 +461,24 @@ size_t ConnectionRef::write_fmt(const char* fmt, ...)
     return n;
 }
 
-void Manager::wakeup(unsigned long conn_id, std::string_view data)
+Manager::Manager()
 {
-    nanosrv::wakeup(raw(), conn_id, data.data(), data.size());
+    mgr_init(&mgr_);
+    // Arm the wakeup pipe here, on the thread that constructs the Manager,
+    // rather than on first use. wakeup() is meant to be called from another
+    // thread while this manager polls; creating the pipe at that point would
+    // allocate a Connection and splice it into mgr_.conns from the calling
+    // thread while the loop thread walks that same list -- a data race, in
+    // precisely the cross-thread case wakeup() exists to serve. The cost is one
+    // socketpair per Manager (ShardedManager's workers already pay it).
+    (void)wakeup_init(&mgr_);
+}
+
+bool Manager::wakeup(unsigned long conn_id, std::string_view data)
+{
+    // Thread-safe: a send() on the pipe, no manager state touched. False means
+    // the pipe could not be created at construction, or the id was rejected.
+    return nanosrv::wakeup(raw(), conn_id, data.data(), data.size());
 }
 
 } // namespace nanosrv

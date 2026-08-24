@@ -33,7 +33,11 @@ class TestEnums:
         assert nanosrv.WsOpcode.Pong.value == 10
 
     def test_log_level_values(self):
-        assert getattr(nanosrv.LogLevel, "None").value == 0
+        # Off, not None: `LogLevel.None` is a SyntaxError in Python, so the
+        # zero level was previously reachable only via getattr.
+        assert nanosrv.LogLevel.Off.value == 0
+        # The old name survives as an alias for existing getattr() call sites.
+        assert getattr(nanosrv.LogLevel, "None") is nanosrv.LogLevel.Off
         assert nanosrv.LogLevel.Error.value == 1
         assert nanosrv.LogLevel.Info.value == 2
         assert nanosrv.LogLevel.Debug.value == 3
@@ -81,15 +85,28 @@ class TestBase64:
         assert nanosrv.base64_encode("hello") == "aGVsbG8="
 
     def test_decode(self):
-        assert nanosrv.base64_decode("aGVsbG8=") == "hello"
+        # base64 decodes to bytes, not text -- the payload need not be UTF-8.
+        assert nanosrv.base64_decode("aGVsbG8=") == b"hello"
 
     def test_roundtrip(self):
         original = "The quick brown fox jumps over the lazy dog"
-        assert nanosrv.base64_decode(nanosrv.base64_encode(original)) == original
+        assert (
+            nanosrv.base64_decode(nanosrv.base64_encode(original)) == original.encode()
+        )
 
     def test_empty(self):
         assert nanosrv.base64_encode("") == ""
-        assert nanosrv.base64_decode("") == ""
+        assert nanosrv.base64_decode("") == b""
+
+    def test_binary_roundtrip(self):
+        """Arbitrary bytes survive; previously decode() raised on non-UTF-8."""
+        original = bytes(range(256))
+        assert nanosrv.base64_decode(nanosrv.base64_encode(original)) == original
+
+    def test_encode_accepts_bytes_like(self):
+        assert nanosrv.base64_encode(b"hello") == "aGVsbG8="
+        assert nanosrv.base64_encode(bytearray(b"hello")) == "aGVsbG8="
+        assert nanosrv.base64_encode(memoryview(b"hello")) == "aGVsbG8="
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +130,17 @@ class TestUrlEncodeDecode:
     def test_special_chars(self):
         encoded = nanosrv.url_encode("a+b=c&d")
         assert "%" in encoded
+
+    def test_decode_non_utf8_does_not_raise(self):
+        """A percent sequence that is not valid UTF-8 must not raise."""
+        decoded = nanosrv.url_decode("%ff%fe")
+        assert decoded.encode("utf-8", "surrogateescape") == b"\xff\xfe"
+
+    def test_decode_bytes_returns_raw(self):
+        assert nanosrv.url_decode_bytes("%ff%fe") == b"\xff\xfe"
+
+    def test_encode_accepts_bytes(self):
+        assert nanosrv.url_encode(b"hello world") == "hello%20world"
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +189,7 @@ class TestLogging:
 
     def test_all_levels(self):
         for level in [
-            getattr(nanosrv.LogLevel, "None"),
+            nanosrv.LogLevel.Off,
             nanosrv.LogLevel.Error,
             nanosrv.LogLevel.Info,
             nanosrv.LogLevel.Debug,
@@ -818,3 +846,554 @@ class TestCallbackObjectLifetime:
         del mgr  # closing the listener must release the callback
         gc.collect()
         assert ref() is None, "callback leaked after Manager teardown"
+
+
+# ---------------------------------------------------------------------------
+# Binary payloads
+#
+# Every payload path used to cross the boundary as str: a binary request body
+# or WebSocket frame raised UnicodeDecodeError inside the handler, and the send
+# paths rejected bytes outright. These pin the bytes contract down.
+# ---------------------------------------------------------------------------
+
+import socket  # noqa: E402
+import base64 as _b64  # noqa: E402
+import os as _os  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+BINARY = bytes([0x89, 0xFF, 0xFE, 0x00, 0x41, 0x80])
+
+
+@contextmanager
+def _polling(mgr):
+    """Drive a Manager's event loop on a background thread for the block."""
+    stop = threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            mgr.poll(10)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=2)
+
+
+@contextmanager
+def _running(mgr):
+    """Run a ShardedManager for the block, stopping it on exit."""
+    runner = threading.Thread(target=mgr.run, daemon=True)
+    runner.start()
+    time.sleep(0.15)
+    try:
+        yield
+    finally:
+        mgr.stop()
+        runner.join(timeout=5)
+
+
+def _post(url, data, timeout=5):
+    req = urllib.request.Request(url, data=data, method="POST")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _ws_connect(host, port, timeout=5):
+    """Minimal RFC 6455 client handshake; returns the connected socket."""
+    s = socket.create_connection((host, port), timeout=timeout)
+    key = _b64.b64encode(_os.urandom(16)).decode()
+    s.sendall(
+        f"GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n\r\n".encode()
+    )
+    deadline = time.time() + timeout
+    buf = b""
+    while b"\r\n\r\n" not in buf and time.time() < deadline:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    assert b"101" in buf, f"upgrade failed: {buf!r}"
+    return s
+
+
+def _ws_send(sock, payload, opcode=0x2):
+    """Send one masked client frame (clients must mask, per RFC 6455 5.1)."""
+    mask = _os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    n = len(payload)
+    assert n < 126, "test helper only encodes 7-bit lengths"
+    sock.sendall(bytes([0x80 | opcode, 0x80 | n]) + mask + masked)
+
+
+def _ws_recv(sock, timeout=5):
+    """Read one unmasked server frame; returns (opcode, payload)."""
+    sock.settimeout(timeout)
+    hdr = sock.recv(2)
+    assert len(hdr) == 2, f"short frame header: {hdr!r}"
+    opcode = hdr[0] & 0x0F
+    n = hdr[1] & 0x7F
+    assert n < 126, "test helper only decodes 7-bit lengths"
+    payload = b""
+    while len(payload) < n:
+        chunk = sock.recv(n - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+    return opcode, payload
+
+
+class TestBinaryPayloads:
+    def test_request_body_is_bytes(self):
+        mgr = nanosrv.Manager()
+        seen = {}
+
+        def handler(conn, msg):
+            seen["body"] = msg.body
+            conn.http_reply(200, "", msg.body)  # echo the raw bytes back
+
+        mgr.http_listen("http://127.0.0.1:18401", handler)
+        with _polling(mgr):
+            resp = _post("http://127.0.0.1:18401/", BINARY)
+            assert resp.read() == BINARY
+
+        assert seen["body"] == BINARY
+        assert isinstance(seen["body"], bytes)
+
+    def test_text_decodes_utf8_and_raises_on_binary(self):
+        mgr = nanosrv.Manager()
+        seen = {}
+
+        def handler(conn, msg):
+            try:
+                seen["text"] = msg.text
+                conn.http_reply(200, "", "decoded")
+            except UnicodeDecodeError:
+                seen["raised"] = True
+                conn.http_reply(400, "", "not text")
+
+        mgr.http_listen("http://127.0.0.1:18402", handler)
+        with _polling(mgr):
+            # Non-ASCII kept as an escape so the source stays 7-bit clean.
+            utf8_text = "h\u00e9llo"
+            resp = _post("http://127.0.0.1:18402/", utf8_text.encode())
+            assert resp.read() == b"decoded"
+            assert seen["text"] == utf8_text
+
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _post("http://127.0.0.1:18402/", BINARY)
+            assert exc.value.code == 400
+            assert seen.get("raised") is True
+
+    def test_metadata_survives_invalid_utf8_without_raising(self):
+        """Header values carry legacy non-UTF-8 bytes in the wild; reading one
+        must not raise inside the handler. (A request *line* containing such
+        bytes is rejected by the parser before any handler sees it.)"""
+        mgr = nanosrv.Manager()
+        seen = {}
+
+        def handler(conn, msg):
+            seen["hdr"] = msg.header("X-Legacy")  # must not raise
+            seen["uri"] = msg.uri
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://127.0.0.1:18403", handler)
+        with _polling(mgr):
+            s = socket.create_connection(("127.0.0.1", 18403), timeout=5)
+            try:
+                s.sendall(b"GET /ok HTTP/1.1\r\nHost: x\r\nX-Legacy: caf\xe9\r\n\r\n")
+                s.settimeout(5)
+                assert b"200" in s.recv(4096)
+            finally:
+                s.close()
+
+        # surrogateescape is lossless: the raw bytes come back out.
+        assert seen["hdr"].encode("utf-8", "surrogateescape") == b"caf\xe9"
+        assert seen["uri"] == "/ok"
+
+    def test_malformed_request_line_is_rejected(self):
+        """Raw non-ASCII in the request line fails the parse (fails closed)."""
+        mgr = nanosrv.Manager()
+        seen = {"calls": 0}
+
+        def handler(conn, msg):
+            seen["calls"] += 1
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://127.0.0.1:18415", handler)
+        with _polling(mgr):
+            s = socket.create_connection(("127.0.0.1", 18415), timeout=5)
+            try:
+                s.sendall(b"GET /bad\xff\xfe HTTP/1.1\r\nHost: x\r\n\r\n")
+                time.sleep(0.2)
+            finally:
+                s.close()
+
+        assert seen["calls"] == 0, "handler ran on an unparseable request"
+
+    def test_send_paths_accept_bytes_like(self):
+        mgr = nanosrv.Manager()
+
+        def handler(conn, msg):
+            if msg.uri == "/mv":
+                conn.http_reply(200, "", memoryview(BINARY))
+            elif msg.uri == "/ba":
+                conn.http_reply(200, "", bytearray(BINARY))
+            elif msg.uri == "/raw":
+                # send_bytes must accept bytes -- it used to reject them.
+                conn.send_bytes(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(BINARY)
+                    + BINARY
+                )
+                # drain(), not close(): close() would discard the unsent bytes.
+                conn.drain()
+            else:
+                conn.http_reply(200, "", "str body")
+
+        mgr.http_listen("http://127.0.0.1:18404", handler)
+        with _polling(mgr):
+            for path in ("/mv", "/ba", "/raw"):
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:18404{path}", timeout=5
+                )
+                assert resp.read() == BINARY, path
+            resp = urllib.request.urlopen("http://127.0.0.1:18404/s", timeout=5)
+            assert resp.read() == b"str body"
+
+    def test_drain_flushes_where_close_would_discard(self):
+        mgr = nanosrv.Manager()
+
+        def handler(conn, msg):
+            body = b"x" * 64
+            conn.send_bytes(
+                b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+            )
+            conn.drain()
+
+        mgr.http_listen("http://127.0.0.1:18416", handler)
+        with _polling(mgr):
+            resp = urllib.request.urlopen("http://127.0.0.1:18416/", timeout=5)
+            assert resp.read() == b"x" * 64
+
+    def test_websocket_binary_frame_round_trip(self):
+        mgr = nanosrv.Manager()
+        seen = {}
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                conn.ws_upgrade(data, "")
+            elif ev == nanosrv.Event.WsMessage:
+                seen["data"] = data.data  # must not raise on a binary frame
+                seen["opcode"] = data.opcode
+                try:
+                    data.text
+                except UnicodeDecodeError:
+                    seen["text_raised"] = True
+                conn.ws_send_binary(data.data)
+
+        mgr.http_listen_event("http://127.0.0.1:18405", handler)
+        with _polling(mgr):
+            s = _ws_connect("127.0.0.1", 18405)
+            try:
+                _ws_send(s, BINARY, opcode=0x2)
+                opcode, payload = _ws_recv(s)
+            finally:
+                s.close()
+
+        assert payload == BINARY
+        assert opcode == 0x2
+        assert seen["data"] == BINARY
+        assert seen["opcode"] == nanosrv.WsOpcode.Binary
+        assert seen.get("text_raised") is True
+
+
+# ---------------------------------------------------------------------------
+# Streamed responses (chunked / SSE)
+# ---------------------------------------------------------------------------
+
+
+class TestStreaming:
+    def test_chunked_response(self):
+        mgr = nanosrv.Manager()
+        pieces = [b"first-", b"second-", BINARY]
+
+        def handler(conn, msg):
+            conn.start_chunked(200, "Content-Type: application/octet-stream\r\n")
+            for p in pieces:
+                conn.write_chunk(p)
+            conn.write_chunk(b"")  # terminating chunk
+
+        mgr.http_listen("http://127.0.0.1:18406", handler)
+        with _polling(mgr):
+            resp = urllib.request.urlopen("http://127.0.0.1:18406/", timeout=5)
+            body = resp.read()
+
+        assert body == b"".join(pieces)
+
+    def test_chunks_are_written_incrementally(self):
+        """The point of streaming: bytes reach the client before the handler
+        has produced the rest of the response."""
+        mgr = nanosrv.Manager()
+        release = threading.Event()
+        conn_ids = {}
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                conn_ids["id"] = conn.id
+                conn.start_chunked(200, "")
+                conn.write_chunk(b"early")
+            elif ev == nanosrv.Event.Wakeup:
+                conn.write_chunk(b"late")
+                conn.write_chunk(b"")
+
+        mgr.http_listen_event("http://127.0.0.1:18407", handler)
+        with _polling(mgr):
+            s = socket.create_connection(("127.0.0.1", 18407), timeout=5)
+            try:
+                s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                s.settimeout(5)
+                head = b""
+                while b"early" not in head:
+                    head += s.recv(4096)
+                # First chunk arrived while the response is still open.
+                assert b"Transfer-Encoding: chunked" in head
+                release.set()
+                mgr.wakeup(conn_ids["id"], b"")
+                rest = b""
+                deadline = time.time() + 5
+                while b"late" not in rest and time.time() < deadline:
+                    rest += s.recv(4096)
+                assert b"late" in rest
+            finally:
+                s.close()
+
+    def test_sse_framing(self):
+        mgr = nanosrv.Manager()
+
+        def handler(conn, msg):
+            conn.start_sse()
+            conn.sse_send("hello", event="greeting", id="1")
+            conn.sse_send("line one\nline two")
+            conn.write_chunk(b"")
+
+        mgr.http_listen("http://127.0.0.1:18408", handler)
+        with _polling(mgr):
+            s = socket.create_connection(("127.0.0.1", 18408), timeout=5)
+            try:
+                s.sendall(b"GET /events HTTP/1.1\r\nHost: x\r\n\r\n")
+                s.settimeout(5)
+                buf = b""
+                deadline = time.time() + 5
+                while b"line two" not in buf and time.time() < deadline:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+            finally:
+                s.close()
+
+        text = buf.decode()
+        assert "Content-Type: text/event-stream" in text
+        assert "event: greeting\nid: 1\ndata: hello\n\n" in text
+        # A multi-line payload becomes one data: line per line.
+        assert "data: line one\ndata: line two\n\n" in text
+
+    def test_send_queue_len_reports_backlog(self):
+        mgr = nanosrv.Manager()
+        seen = {}
+
+        def handler(conn, msg):
+            assert conn.send_queue_len == 0
+            conn.http_reply(200, "", "x" * 4096)
+            seen["after"] = conn.send_queue_len
+
+        mgr.http_listen("http://127.0.0.1:18409", handler)
+        with _polling(mgr):
+            urllib.request.urlopen("http://127.0.0.1:18409/", timeout=5).read()
+
+        # The reply is buffered on the connection before the loop writes it.
+        assert seen["after"] >= 4096
+
+
+# ---------------------------------------------------------------------------
+# Wakeup: acting on a connection from outside its handler
+# ---------------------------------------------------------------------------
+
+
+class TestWakeup:
+    def test_manager_wakeup_delivers_payload(self):
+        mgr = nanosrv.Manager()
+        seen = {}
+        got_request = threading.Event()
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                seen["id"] = conn.id
+                got_request.set()  # reply later, from the wakeup
+            elif ev == nanosrv.Event.Wakeup:
+                seen["payload"] = data
+                conn.http_reply(200, "", data)
+
+        mgr.http_listen_event("http://127.0.0.1:18410", handler)
+        with _polling(mgr):
+            result = {}
+
+            def client():
+                try:
+                    r = urllib.request.urlopen("http://127.0.0.1:18410/", timeout=5)
+                    result["body"] = r.read()
+                except Exception as e:  # noqa: BLE001
+                    result["err"] = e
+
+            t = threading.Thread(target=client)
+            t.start()
+            assert got_request.wait(5), "handler never saw the request"
+            assert mgr.wakeup(seen["id"], BINARY) is True
+            t.join(timeout=5)
+
+        assert result.get("body") == BINARY, f"got {result}"
+        assert seen["payload"] == BINARY
+        assert isinstance(seen["payload"], bytes)
+
+    def test_wakeup_unknown_id_is_reported(self):
+        mgr = nanosrv.Manager()
+        mgr.http_listen("http://127.0.0.1:18411", lambda c, m: None)
+        with _polling(mgr):
+            # An id that matches nothing is delivered to no one, but the pipe
+            # write itself succeeds; id 0 is rejected outright.
+            assert mgr.wakeup(0, b"x") is False
+
+
+# ---------------------------------------------------------------------------
+# ShardedManager parity: WebSocket and wakeup on the multi-threaded path
+# ---------------------------------------------------------------------------
+
+
+class TestShardedParity:
+    def test_websocket_over_sharded_manager(self):
+        """http_listen_event is what makes WebSocket possible here at all --
+        http_listen only ever delivers HttpMessage."""
+        mgr = nanosrv.ShardedManager(4)
+        seen = {}
+        lock = threading.Lock()
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                conn.ws_upgrade(data, "")
+            elif ev == nanosrv.Event.WsOpen:
+                with lock:
+                    seen["opened"] = True
+            elif ev == nanosrv.Event.WsMessage:
+                conn.ws_send_binary(data.data)
+
+        mgr.http_listen_event("http://127.0.0.1:18412", handler)
+        with _running(mgr):
+            s = _ws_connect("127.0.0.1", 18412)
+            try:
+                _ws_send(s, BINARY, opcode=0x2)
+                opcode, payload = _ws_recv(s)
+            finally:
+                s.close()
+
+        assert payload == BINARY
+        assert opcode == 0x2
+        assert seen.get("opened") is True
+
+    def test_repeated_run_stop_cycles(self):
+        """Each run() creates fresh worker threads, and each worker registers a
+        Python thread state on start and releases it on exit. Cycling run/stop
+        must not strand or double-free one."""
+        mgr = nanosrv.ShardedManager(2)
+        mgr.http_listen(
+            "http://127.0.0.1:18417", lambda c, m: c.http_reply(200, "", "ok")
+        )
+        for _ in range(3):
+            runner = threading.Thread(target=mgr.run, daemon=True)
+            runner.start()
+            time.sleep(0.3)
+            body = urllib.request.urlopen("http://127.0.0.1:18417/", timeout=5).read()
+            assert body == b"ok"
+            mgr.stop()
+            runner.join(timeout=5)
+            assert not runner.is_alive(), "run() did not return after stop()"
+
+    def test_connection_ids_are_unique_across_workers(self):
+        """Each worker used to number its connections from 1 independently, so
+        ids collided and could not identify a connection."""
+        mgr = nanosrv.ShardedManager(4)
+        ids = []
+        lock = threading.Lock()
+
+        def handler(conn, msg):
+            with lock:
+                ids.append(conn.id)
+            conn.http_reply(200, "", "ok")
+
+        mgr.http_listen("http://127.0.0.1:18413", handler)
+        with _running(mgr):
+            threads = []
+            for _ in range(16):
+                t = threading.Thread(
+                    target=lambda: urllib.request.urlopen(
+                        "http://127.0.0.1:18413/", timeout=5
+                    ).read()
+                )
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join(timeout=10)
+
+        assert len(ids) == 16, f"only {len(ids)} requests handled"
+        assert len(set(ids)) == len(ids), f"duplicate connection ids: {ids}"
+
+    def test_sharded_wakeup_routes_to_the_owning_worker(self):
+        mgr = nanosrv.ShardedManager(4)
+        pending = {}
+        lock = threading.Lock()
+        arrived = threading.Event()
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                with lock:
+                    # Path identifies the client; id routes the wakeup back.
+                    pending[msg_path(data)] = conn.id
+                    if len(pending) == 4:
+                        arrived.set()
+            elif ev == nanosrv.Event.Wakeup:
+                conn.http_reply(200, "", data)
+
+        def msg_path(msg):
+            return msg.uri
+
+        mgr.http_listen_event("http://127.0.0.1:18414", handler)
+        results = {}
+
+        def client(path):
+            try:
+                r = urllib.request.urlopen(f"http://127.0.0.1:18414{path}", timeout=10)
+                results[path] = r.read()
+            except Exception as e:  # noqa: BLE001
+                results[path] = e
+
+        with _running(mgr):
+            paths = [f"/c{i}" for i in range(4)]
+            threads = [threading.Thread(target=client, args=(p,)) for p in paths]
+            for t in threads:
+                t.start()
+            assert arrived.wait(10), f"only {len(pending)} requests arrived"
+
+            # Each connection is woken with a payload unique to its path; if the
+            # wakeup were routed to the wrong worker or the wrong connection,
+            # the bodies would not match up.
+            with lock:
+                for path, conn_id in pending.items():
+                    assert mgr.wakeup(conn_id, path.encode()) is True
+            for t in threads:
+                t.join(timeout=10)
+
+        for path in paths:
+            assert results.get(path) == path.encode(), f"{path}: {results}"

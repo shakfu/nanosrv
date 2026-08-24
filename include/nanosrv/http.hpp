@@ -40,10 +40,18 @@ constexpr int MG_HTTP_TOO_MANY_HEADERS = -2;
 [[nodiscard]] int http_get_request_len(const unsigned char* buf, size_t buf_len);
 void http_printf_chunk(struct Connection* cnn, const char* fmt, ...);
 void http_write_chunk(struct Connection* c, const char* buf, size_t len);
+// Streamed-response prologues; see the definitions in http.cpp. Follow
+// either with http_write_chunk() per piece and a zero-length chunk to end.
+void http_start_chunked(struct Connection* c, int code, const char* headers);
+void http_start_sse(struct Connection* c, const char* headers);
 [[nodiscard]] struct Connection* http_listen(struct Mgr*, const char* url,
                                      EventHandler fn, void* fn_data);
 void http_reply(struct Connection*, int status_code, const char* headers,
                    const char* body_fmt, ...);
+// Binary-safe counterpart to http_reply(); see the definition in http.cpp for
+// why the formatted variant cannot carry a body containing NUL bytes.
+void http_reply_bytes(struct Connection* c, int status_code,
+                      const char* headers, const void* body, size_t len);
 [[nodiscard]] struct Str* http_get_header(struct HttpMessage*, const char* name);
 struct Str http_var(struct Str buf, struct Str name);
 int http_get_var(const struct Str*, const char* name, char*, size_t);

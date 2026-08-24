@@ -50,6 +50,10 @@ peers are closed with status 1002), and rejection of requests carrying more than
 `MG_MAX_HTTP_HEADERS` (answered 431 rather than silently truncated).
 `ShardedManager::drain()` / `Manager::start_drain()` provide graceful shutdown.
 
+Note that `Connection.close()` is immediate and discards anything still
+buffered for sending; `Connection.drain()` closes once the output has been
+flushed.
+
 For observability during an incident, `Manager.metrics` /
 `ShardedManager.metrics` expose cumulative counters (accepted, closed, errors,
 bytes read/written) and a live connection gauge.
@@ -60,7 +64,10 @@ The `Connection`, `HttpMessage`, and `WsMessage` objects passed to a handler are
 borrowed views valid **only for the duration of that call** -- they point into
 buffers the event loop reuses or frees once the handler returns. Copy out any
 bytes you need to keep; do not retain a handle and use it from a later event, a
-timer, or another thread. The Python bindings enforce this by raising on
+timer, or another thread. To act on a connection afterwards, keep `conn.id` and
+call `wakeup(id, data)` on the `Manager` or `ShardedManager` -- it is
+thread-safe and delivers the payload to the handler on the loop that owns the
+connection. The Python bindings enforce this by raising on
 use-after-return (see `TestCallbackObjectLifetime`). The exception is
 `ConnectionRef` (returned by `http_listen()`), which remains valid until its
 listener closes.

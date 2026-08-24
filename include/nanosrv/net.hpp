@@ -142,6 +142,11 @@ struct Mgr {
     std::atomic<uint64_t> stat_bytes_written; // bytes written to the wire, total
     bool use_dns6;
     unsigned long nextid;
+    // Increment applied to nextid per allocated connection. 1 for a standalone
+    // Manager. A ShardedManager sets worker i to nextid = i, id_stride = N, so
+    // connection ids never collide between workers and `id % N` identifies the
+    // owning worker -- the routing key for ShardedManager::wakeup().
+    unsigned long id_stride;
     void* userdata;
     void* tls_ctx;
     uint16_t mqtt_id;
@@ -303,7 +308,9 @@ struct Metrics {
 // hold back-pointers to the manager).
 class Manager {
 public:
-    Manager() { mgr_init(&mgr_); }
+    // Defined out-of-line: the constructor arms the cross-thread wakeup pipe,
+    // and wakeup_init() is declared in http.hpp, which includes this header.
+    Manager();
     ~Manager() { mgr_free(&mgr_); }
 
     Manager(const Manager&) = delete;
@@ -339,8 +346,11 @@ public:
                                std::function<void(Connection&, HttpMessage&)>>)
     ConnectionRef http_listen(std::string_view url, F&& handler);
 
-    // Wakeup a connection by ID
-    void wakeup(unsigned long conn_id, std::string_view data = {});
+    // Deliver MG_EV_WAKEUP with `data` to the connection with this id, from
+    // any thread. Returns false if the id matches no connection on this
+    // manager or the wakeup pipe is not up. This is the supported way to act
+    // on a connection outside its handler.
+    bool wakeup(unsigned long conn_id, std::string_view data = {});
 
     // Idle timeout (ms) for accepted connections; 0 disables it (the default).
     // An accepted connection with no read/write activity for this long is closed
@@ -432,7 +442,44 @@ public:
     ShardedManager& operator=(const ShardedManager&) = delete;
 
     // Listen for HTTP connections. Workers handle accepted connections.
+    // The handler runs on the worker thread that owns the connection.
     void http_listen(std::string_view url, HttpHandler handler);
+
+    // Listen with a full event handler, so WebSocket (and every other event)
+    // is usable on the sharded path -- http_listen() only ever delivers
+    // MG_EV_HTTP_MSG. Deliberately a separate name rather than an overload:
+    // a lambda converts to both handler types, so an overload would be
+    // ambiguous at every call site.
+    void http_listen_event(std::string_view url, HandlerFn handler);
+
+    // Hooks run on each worker thread, once when it starts and once when it
+    // finishes -- not per request. They exist for language bindings that must
+    // register a thread with their runtime: without them, a binding can only
+    // do that work inside the per-request callback, and paying a
+    // thread-registration cost per request is ruinous on some runtimes (see
+    // the free-threaded CPython note in the Python bindings). Set before
+    // run(); the hooks must not touch this manager.
+    using ThreadHook = std::function<void()>;
+    void set_worker_hooks(ThreadHook on_start, ThreadHook on_stop)
+    {
+        on_worker_start_ = std::move(on_start);
+        on_worker_stop_ = std::move(on_stop);
+    }
+
+    // Wake a connection owned by any worker, delivering Event::Wakeup with
+    // `data` to its handler on that worker's thread. Thread-safe; this is the
+    // supported way to push to a connection from outside its handler (a stored
+    // Connection& is only valid for the duration of the call that received it).
+    // Returns false if the id routes to no worker or the wakeup pipes are not
+    // up yet -- i.e. before run() has started or after it has returned.
+    bool wakeup(unsigned long conn_id, std::string_view data = {});
+
+    // Connect deadline (ms) for client-initiated connections, applied to every
+    // worker. Set before run().
+    void set_connect_timeout(int ms) {
+        for (auto& w : workers_)
+            w->set_connect_timeout(ms);
+    }
 
     // Start worker threads + acceptor loop. Blocks until stop() is called.
     void run();
@@ -507,6 +554,9 @@ private:
     // Wake the acceptor and worker loops if their pipes are initialized.
     void wake_all();
 
+    ThreadHook on_worker_start_;
+    ThreadHook on_worker_stop_;
+
     std::vector<std::unique_ptr<Manager>> workers_;
     std::vector<std::thread> threads_;
     Manager acceptor_;
@@ -515,8 +565,12 @@ private:
     // object is not torn down while run() is still executing on another thread.
     std::atomic<bool> run_active_{false};
     std::atomic<unsigned> next_{0};
+    // Shared listen path for http_listen() / http_listen_event(). The handler
+    // is stored per listener and travels with each handed-off FD, so several
+    // listeners with different handlers coexist correctly.
+    void listen_impl(std::string_view url, HandlerFn handler);
+
     std::shared_ptr<std::vector<WorkerQueue>> queues_;
-    std::shared_ptr<HttpHandler> handler_;
     // Global accepted-connection cap, enforced at the single acceptor thread.
     // max_connections_ is the limit (0 = disabled); live_conns_ is the count of
     // connections handed off and not yet closed by a worker. The acceptor reads

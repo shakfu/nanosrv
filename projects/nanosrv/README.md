@@ -2,7 +2,11 @@
 
 A C++23 HTTP/WebSocket server library. This is the core library that nanosrv-server, nanosrv-sharded, and the Python bindings all link against.
 
-libnanosrv is an independent C++ implementation inspired by Mongoose's event-loop architecture but rewritten from scratch with typed callbacks, RAII resource management, and a sharded multi-threading model.
+libnanosrv is a C++23 port and refactor of the HTTP/WebSocket subset of
+[Mongoose 7.21](https://github.com/cesanta/mongoose) (the same subset vendored as `projects/mungo`),
+adding typed callbacks, RAII resource management, and a sharded multi-threading model.
+It is a derivative work of Mongoose and is licensed **GPL-2.0-only**; see
+[PROVENANCE.md](../../PROVENANCE.md) for what is inherited and what is original.
 
 ## Features
 

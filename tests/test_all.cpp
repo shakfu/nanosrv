@@ -11,7 +11,9 @@
 #include <thread>
 
 #ifndef _WIN32
+#include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <vector>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1618,6 +1620,386 @@ static void test_sharded_drain_deadline()
 }
 #endif  // _WIN32
 
+// ---- Binary-safe reply (http_reply_bytes) ----
+
+// http_reply() formats its body through xprintf's "%s", which stops at the
+// first NUL byte even with an explicit precision -- so it silently truncates
+// binary payloads. http_reply_bytes() is length-counted; this pins that down.
+static void test_http_reply_bytes_binary_safe()
+{
+    const uint16_t port = 18901;
+    const char payload[] = { '\x89', '\xff', '\x00', 'A', '\x80' };
+    const size_t payload_len = sizeof(payload);
+
+    Manager mgr;
+    auto ref = mgr.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [&](Connection& c, HttpMessage&) {
+            http_reply_bytes(&c, 200, "Content-Type: application/octet-stream\r\n",
+                             payload, payload_len);
+        });
+    assert(ref);
+
+    std::atomic<bool> stop{false};
+    std::thread loop([&mgr, &stop]() {
+        while (!stop.load())
+            mgr.poll(10);
+    });
+    std::this_thread::sleep_for(50ms);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+    const char* req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(send(fd, req, strlen(req), 0) > 0);
+
+    char buf[512];
+    size_t total = 0;
+    for (int i = 0; i < 50 && total < sizeof(buf); i++) {
+        struct timeval tv { 0, 100000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, buf + total, sizeof(buf) - total, 0);
+        if (n > 0)
+            total += static_cast<size_t>(n);
+        std::string_view got(buf, total);
+        if (got.find("\r\n\r\n") != std::string_view::npos
+            && got.size() >= got.find("\r\n\r\n") + 4 + payload_len)
+            break;
+    }
+    close(fd);
+    stop.store(true);
+    loop.join();
+
+    std::string_view resp(buf, total);
+    size_t hdr_end = resp.find("\r\n\r\n");
+    assert(hdr_end != std::string_view::npos);
+    assert(resp.find("Content-Length: 5") != std::string_view::npos);
+    std::string_view body = resp.substr(hdr_end + 4);
+    assert(body.size() == payload_len);           // not truncated at the NUL
+    assert(memcmp(body.data(), payload, payload_len) == 0);
+}
+
+// ---- Streamed responses (chunked prologue + chunk writes) ----
+
+static void test_http_chunked_response()
+{
+    const uint16_t port = 18902;
+
+    Manager mgr;
+    auto ref = mgr.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [](Connection& c, HttpMessage&) {
+            http_start_chunked(&c, 200, "Content-Type: text/plain\r\n");
+            http_write_chunk(&c, "alpha", 5);
+            http_write_chunk(&c, "beta", 4);
+            http_write_chunk(&c, "", 0);  // terminating chunk
+        });
+    assert(ref);
+
+    std::atomic<bool> stop{false};
+    std::thread loop([&mgr, &stop]() {
+        while (!stop.load())
+            mgr.poll(10);
+    });
+    std::this_thread::sleep_for(50ms);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+    const char* req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(send(fd, req, strlen(req), 0) > 0);
+
+    char buf[1024];
+    size_t total = 0;
+    for (int i = 0; i < 50 && total < sizeof(buf); i++) {
+        struct timeval tv { 0, 100000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, buf + total, sizeof(buf) - total, 0);
+        if (n > 0)
+            total += static_cast<size_t>(n);
+        if (std::string_view(buf, total).find("0\r\n\r\n") != std::string_view::npos)
+            break;
+    }
+    close(fd);
+    stop.store(true);
+    loop.join();
+
+    std::string_view resp(buf, total);
+    assert(resp.find("Transfer-Encoding: chunked") != std::string_view::npos);
+    // Chunk framing: <hex len>\r\n<data>\r\n, ended by a zero-length chunk.
+    assert(resp.find("5\r\nalpha\r\n") != std::string_view::npos);
+    assert(resp.find("4\r\nbeta\r\n") != std::string_view::npos);
+    assert(resp.find("0\r\n\r\n") != std::string_view::npos);
+}
+
+static void test_http_sse_prologue()
+{
+    const uint16_t port = 18903;
+
+    Manager mgr;
+    auto ref = mgr.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [](Connection& c, HttpMessage&) {
+            http_start_sse(&c, "");
+            const char* ev = "data: tick\n\n";
+            http_write_chunk(&c, ev, strlen(ev));
+        });
+    assert(ref);
+
+    std::atomic<bool> stop{false};
+    std::thread loop([&mgr, &stop]() {
+        while (!stop.load())
+            mgr.poll(10);
+    });
+    std::this_thread::sleep_for(50ms);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+    const char* req = "GET /events HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert(send(fd, req, strlen(req), 0) > 0);
+
+    char buf[1024];
+    size_t total = 0;
+    for (int i = 0; i < 50 && total < sizeof(buf); i++) {
+        struct timeval tv { 0, 100000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, buf + total, sizeof(buf) - total, 0);
+        if (n > 0)
+            total += static_cast<size_t>(n);
+        if (std::string_view(buf, total).find("tick") != std::string_view::npos)
+            break;
+    }
+    close(fd);
+    stop.store(true);
+    loop.join();
+
+    std::string_view resp(buf, total);
+    assert(resp.find("Content-Type: text/event-stream") != std::string_view::npos);
+    assert(resp.find("Cache-Control: no-cache") != std::string_view::npos);
+    assert(resp.find("Transfer-Encoding: chunked") != std::string_view::npos);
+    assert(resp.find("data: tick") != std::string_view::npos);
+}
+
+// ---- Cross-thread wakeup on a single Manager ----
+
+// wakeup() exists to act on a connection from another thread while the loop
+// polls. Arming the pipe on first use would have allocated a Connection and
+// spliced it into mgr->conns from the calling thread while the loop walked
+// that list; the pipe is armed in the constructor instead. Run under TSan,
+// this test is what proves the point.
+static void test_manager_wakeup_cross_thread()
+{
+    const uint16_t port = 18907;
+
+    Manager mgr;
+    std::atomic<unsigned long> conn_id{0};
+    std::atomic<int> woken{0};
+    std::string payload = "woken-payload";
+
+    auto ref = mgr.http_listen(
+        std::string("http://127.0.0.1:") + std::to_string(port),
+        HandlerFn([&](Connection& c, Event ev, void* ev_data) {
+            if (ev == Event::HttpMessage) {
+                conn_id.store(c.id);   // reply from the wakeup, not from here
+            } else if (ev == Event::Wakeup) {
+                auto* d = static_cast<struct Str*>(ev_data);
+                woken.fetch_add(1, std::memory_order_relaxed);
+                http_reply(&c, 200, "Content-Type: text/plain\r\n", "%.*s",
+                           static_cast<int>(d->len), d->buf);
+            }
+        }));
+    assert(ref);
+
+    std::atomic<bool> stop{false};
+    std::thread loop([&mgr, &stop]() {
+        while (!stop.load())
+            mgr.poll(10);
+    });
+    std::this_thread::sleep_for(50ms);
+
+    std::atomic<bool> got_200{false};
+    std::thread client([&got_200, port]() {
+        got_200.store(http_get_200(port));
+    });
+
+    // Wait for the request to reach the handler, then wake it from this thread.
+    for (int i = 0; i < 200 && conn_id.load() == 0; i++)
+        std::this_thread::sleep_for(10ms);
+    assert(conn_id.load() != 0);
+    assert(mgr.wakeup(conn_id.load(), payload));
+
+    client.join();
+    stop.store(true);
+    loop.join();
+
+    assert(woken.load() == 1);
+    assert(got_200.load());
+    assert(!mgr.wakeup(0, "x"));  // id 0 is rejected
+}
+
+// ---- ShardedManager: event handlers, unique ids, routed wakeup ----
+
+// http_listen() only ever delivers MG_EV_HTTP_MSG, so WebSocket (and every
+// other event) was unreachable on the sharded path. http_listen_event()
+// delivers the whole event stream; ids must also be unique across workers, or
+// a wakeup cannot be routed to the connection that owns it.
+static void test_sharded_event_handler_and_wakeup()
+{
+    const uint16_t port = 18904;
+    const int num_workers = 4;
+    const int num_clients = 12;
+
+    ShardedManager sharded(num_workers);
+
+    std::mutex mu;
+    std::vector<unsigned long> ids;
+    std::atomic<int> woken{0};
+    std::atomic<bool> saw_non_http_event{false};
+
+    sharded.http_listen_event(
+        std::string("http://127.0.0.1:") + std::to_string(port),
+        [&](Connection& c, Event ev, void* ev_data) {
+            if (ev == Event::Open || ev == Event::Read)
+                saw_non_http_event.store(true);  // http_listen() never shows these
+            if (ev == Event::HttpMessage) {
+                std::lock_guard<std::mutex> lock(mu);
+                ids.push_back(c.id);  // reply later, from the wakeup
+            } else if (ev == Event::Wakeup) {
+                auto* d = static_cast<struct Str*>(ev_data);
+                woken.fetch_add(1, std::memory_order_relaxed);
+                http_reply(&c, 200, "Content-Type: text/plain\r\n", "%.*s",
+                           static_cast<int>(d->len), d->buf);
+            }
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(150ms);
+
+    std::atomic<int> ok_count{0};
+    std::vector<std::thread> clients;
+    clients.reserve(num_clients);
+    for (int i = 0; i < num_clients; i++)
+        clients.emplace_back([&ok_count, port]() {
+            if (http_get_200(port))
+                ok_count.fetch_add(1, std::memory_order_relaxed);
+        });
+
+    // Wait for every request to reach a worker, then wake each connection --
+    // this is what fails if two workers hand out the same id.
+    for (int i = 0; i < 200; i++) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (ids.size() == static_cast<size_t>(num_clients))
+                break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        assert(ids.size() == static_cast<size_t>(num_clients));
+        std::vector<unsigned long> sorted = ids;
+        std::sort(sorted.begin(), sorted.end());
+        assert(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end()
+               && "connection ids collided across workers");
+        for (unsigned long id : ids)
+            assert(sharded.wakeup(id, "ok") && "wakeup did not route");
+    }
+
+    for (auto& t : clients)
+        t.join();
+
+    sharded.stop();
+    runner.join();
+
+    assert(ok_count.load() == num_clients);
+    assert(woken.load() == num_clients);
+    assert(saw_non_http_event.load() && "event handler saw only HTTP messages");
+    // A wakeup outside run() has no pipe to write to and must say so.
+    assert(!sharded.wakeup(1, "x"));
+}
+
+// Worker-thread hooks fire exactly once per worker, on the worker thread, and
+// the stop hook runs however the loop exits. Language bindings rely on this to
+// register a thread with their runtime once instead of once per request.
+static void test_sharded_worker_hooks()
+{
+    const uint16_t port = 18908;
+    const unsigned num_workers = 4;
+
+    ShardedManager sharded(num_workers);
+    std::atomic<int> starts{0}, stops{0};
+    std::mutex mu;
+    std::vector<std::thread::id> start_threads;
+
+    sharded.set_worker_hooks(
+        [&]() {
+            std::lock_guard<std::mutex> lock(mu);
+            start_threads.push_back(std::this_thread::get_id());
+            starts.fetch_add(1, std::memory_order_relaxed);
+        },
+        [&]() { stops.fetch_add(1, std::memory_order_relaxed); });
+
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port),
+        [](Connection& c, HttpMessage&) {
+            http_reply(&c, 200, "Content-Type: text/plain\r\n", "ok");
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(150ms);
+    assert(http_get_200(port));
+    sharded.stop();
+    runner.join();
+
+    assert(starts.load() == static_cast<int>(num_workers));
+    assert(stops.load() == static_cast<int>(num_workers));
+    {
+        // Each hook ran on a distinct thread: one per worker, not one per call.
+        std::lock_guard<std::mutex> lock(mu);
+        std::sort(start_threads.begin(), start_threads.end());
+        assert(std::adjacent_find(start_threads.begin(), start_threads.end())
+               == start_threads.end());
+    }
+}
+
+// Two listeners with different handlers must both work: the handler travels
+// with each handed-off connection, rather than the manager holding one.
+static void test_sharded_multiple_listeners()
+{
+    const uint16_t port_a = 18905, port_b = 18906;
+    ShardedManager sharded(2);
+
+    std::atomic<int> hits_a{0}, hits_b{0};
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port_a),
+        [&hits_a](Connection& c, HttpMessage&) {
+            hits_a.fetch_add(1, std::memory_order_relaxed);
+            http_reply(&c, 200, "Content-Type: text/plain\r\n", "A");
+        });
+    sharded.http_listen(std::string("http://127.0.0.1:") + std::to_string(port_b),
+        [&hits_b](Connection& c, HttpMessage&) {
+            hits_b.fetch_add(1, std::memory_order_relaxed);
+            http_reply(&c, 200, "Content-Type: text/plain\r\n", "B");
+        });
+
+    std::thread runner([&sharded]() { sharded.run(); });
+    std::this_thread::sleep_for(150ms);
+
+    assert(http_get_200(port_a));
+    assert(http_get_200(port_b));
+
+    sharded.stop();
+    runner.join();
+
+    assert(hits_a.load() == 1 && hits_b.load() == 1);
+}
+
 int main()
 {
     test_base64_roundtrip();
@@ -1678,6 +2060,13 @@ int main()
     test_sharded_max_connections();
     test_sharded_graceful_drain();
     test_sharded_drain_deadline();
+    test_http_reply_bytes_binary_safe();
+    test_manager_wakeup_cross_thread();
+    test_http_chunked_response();
+    test_http_sse_prologue();
+    test_sharded_event_handler_and_wakeup();
+    test_sharded_multiple_listeners();
+    test_sharded_worker_hooks();
 #endif
 
     puts("All tests passed");

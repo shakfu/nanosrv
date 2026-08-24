@@ -556,6 +556,48 @@ void http_reply(struct Connection* c, int code, const char* headers,
     c->is_resp = 0;
 }
 
+// Length-counted reply: emits `len` bytes of `body` verbatim, NUL bytes
+// included. http_reply() cannot do this -- it formats the body through
+// xprintf's "%s", whose scpy() stops at the first NUL even when an explicit
+// precision is given, so any body containing a zero byte is silently
+// truncated. Use this for binary payloads; http_reply() remains the formatted
+// convenience for text.
+void http_reply_bytes(struct Connection* c, int code, const char* headers,
+                      const void* body, size_t len)
+{
+    conn_printf(c, "HTTP/1.1 %d %s\r\n%sContent-Length: %lu\r\n\r\n", code,
+                http_status_code_str(code), headers == NULL ? "" : headers,
+                static_cast<unsigned long>(len));
+    if (len > 0 && !send_data(c, body, len))
+        error(c, "OOM");
+    c->is_resp = 0;
+}
+
+// Begin a streamed response: status line, caller headers, then chunked
+// framing. Every subsequent http_write_chunk() emits one chunk; a zero-length
+// chunk ends the response (and clears is_resp, so the connection is reusable).
+// Sending the Transfer-Encoding header is what makes the chunk framing legal --
+// emitting chunks without it corrupts the stream for the client.
+void http_start_chunked(struct Connection* c, int code, const char* headers)
+{
+    conn_printf(c, "HTTP/1.1 %d %s\r\n%sTransfer-Encoding: chunked\r\n\r\n",
+                code, http_status_code_str(code),
+                headers == NULL ? "" : headers);
+}
+
+// Begin a Server-Sent Events stream. Same framing as http_start_chunked() with
+// the SSE content type and the caching/keep-alive headers browsers expect.
+void http_start_sse(struct Connection* c, const char* headers)
+{
+    conn_printf(c,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: keep-alive\r\n"
+                "%sTransfer-Encoding: chunked\r\n\r\n",
+                headers == NULL ? "" : headers);
+}
+
 int http_status(const struct HttpMessage* hm)
 {
     return atoi(hm->uri.buf);

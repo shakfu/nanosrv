@@ -15,11 +15,15 @@ namespace nanosrv {
 
 using HttpHandler = Manager::HttpHandler;
 
-// Pending connection: FD + addresses stolen from the acceptor.
+// Pending connection: FD + addresses stolen from the acceptor, plus the
+// handler of the listener that accepted it. Carrying the handler per item (not
+// per ShardedManager) is what lets several listeners with different handlers
+// coexist -- previously a second http_listen() overwrote the first's handler.
 struct PendingConn {
     MG_SOCKET_TYPE fd;
     Address rem;
     Address loc;
+    std::shared_ptr<HandlerFn> handler;
 };
 
 // Per-worker queue of connections to adopt.
@@ -32,7 +36,7 @@ struct WorkerQueue {
 // shared live-connection counter, decremented when the connection closes so the
 // acceptor's global max-connection cap stays accurate.
 struct AdoptCtx {
-    HttpHandler handler;
+    std::shared_ptr<HandlerFn> handler;
     std::atomic<int>* live;
 };
 
@@ -51,8 +55,7 @@ static void wake_mgr(Mgr* mgr)
 // Adopt every FD currently queued for this worker into its event loop. Runs on
 // the worker thread only. Each adopted connection gets its own copy of the
 // user's handler as fn_data and the HTTP protocol handler as pfn.
-static void drain_worker(Mgr* mgr, WorkerQueue* q, const HttpHandler& handler,
-                         std::atomic<int>* live)
+static void drain_worker(Mgr* mgr, WorkerQueue* q, std::atomic<int>* live)
 {
     for (;;) {
         PendingConn pc;
@@ -64,12 +67,16 @@ static void drain_worker(Mgr* mgr, WorkerQueue* q, const HttpHandler& handler,
             q->pending.pop();
         }
 
-        auto* ctx = new AdoptCtx{handler, live};
+        auto* ctx = new AdoptCtx{pc.handler, live};
         auto* c = wrapfd(mgr, pc.fd,
             [](Connection* c, int ev, void* ev_data) {
                 auto* ctx = static_cast<AdoptCtx*>(c->fn_data);
-                if (ev == MG_EV_HTTP_MSG)
-                    ctx->handler(*c, *static_cast<HttpMessage*>(ev_data));
+                // Every event reaches the handler: http_listen() wraps an
+                // HttpHandler in a HandlerFn that filters for HttpMessage,
+                // while http_listen_event() wants the whole stream (WsOpen,
+                // WsMessage, Wakeup, Close, ...).
+                if (ctx->handler)
+                    (*ctx->handler)(*c, static_cast<Event>(ev), ev_data);
                 if (ev == MG_EV_CLOSE) {
                     if (ctx->live)
                         ctx->live->fetch_sub(1, std::memory_order_relaxed);
@@ -117,8 +124,16 @@ ShardedManager::ShardedManager(unsigned num_threads)
         num_threads = 2;  // Fallback
 
     workers_.reserve(num_threads);
-    for (unsigned i = 0; i < num_threads; i++)
+    for (unsigned i = 0; i < num_threads; i++) {
         workers_.push_back(std::make_unique<Manager>());
+        // Partition the connection-id space across workers: worker i issues
+        // ids congruent to i modulo N. Without this every worker counted from
+        // 1 independently, so ids collided and a wakeup could not be routed
+        // (nor could a caller tell two connections apart by id).
+        Mgr* m = workers_.back()->raw();
+        m->nextid = i;
+        m->id_stride = num_threads;
+    }
 }
 
 ShardedManager::~ShardedManager()
@@ -133,9 +148,30 @@ ShardedManager::~ShardedManager()
 
 void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
 {
-    auto queues = std::make_shared<std::vector<WorkerQueue>>(workers_.size());
-    queues_ = queues;
-    handler_ = std::make_shared<HttpHandler>(std::move(handler));
+    // Adapt the HTTP-only handler to the general event signature, preserving
+    // the previous semantics exactly: it fires on a complete HTTP message and
+    // on nothing else.
+    listen_impl(url, HandlerFn([h = std::move(handler)](Connection& c, Event ev,
+                                                       void* ev_data) {
+        if (ev == Event::HttpMessage)
+            h(c, *static_cast<HttpMessage*>(ev_data));
+    }));
+}
+
+void ShardedManager::http_listen_event(std::string_view url, HandlerFn handler)
+{
+    listen_impl(url, std::move(handler));
+}
+
+void ShardedManager::listen_impl(std::string_view url, HandlerFn handler)
+{
+    // One queue vector for the whole manager, created on the first listen and
+    // shared by every later one -- the worker threads drain a single queue per
+    // worker regardless of how many listeners feed it.
+    if (!queues_)
+        queues_ = std::make_shared<std::vector<WorkerQueue>>(workers_.size());
+    auto queues = queues_;
+    auto listener_handler = std::make_shared<HandlerFn>(std::move(handler));
 
     // Raw worker manager pointers for cross-thread wakeups. Valid as long as
     // this ShardedManager (hence workers_) is alive, which outlives the acceptor.
@@ -159,8 +195,8 @@ void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
     // value (or by stable pointer for the cap/drain flag) in the std::function
     // (owned by the acceptor's listener connection), so there is nothing to leak.
     acceptor_.http_listen(url_str,
-        HandlerFn([queues, next, num_workers, worker_mgrs, maxp, live, draining](
-                      Connection& c, Event ev, void*) {
+        HandlerFn([queues, next, num_workers, worker_mgrs, maxp, live, draining,
+                   listener_handler](Connection& c, Event ev, void*) {
             if (ev != Event::Accept)
                 return;  // accepted conns are detached/closed; ignore the rest
 
@@ -192,7 +228,7 @@ void ShardedManager::http_listen(std::string_view url, HttpHandler handler)
                 next->fetch_add(1, std::memory_order_relaxed) % num_workers;
             {
                 std::lock_guard<std::mutex> lock((*queues)[idx].mu);
-                (*queues)[idx].pending.push({fd, rem, loc});
+                (*queues)[idx].pending.push({fd, rem, loc, listener_handler});
             }
             wake_mgr(worker_mgrs[idx]);  // drain promptly instead of on a timer
         }));
@@ -219,12 +255,22 @@ void ShardedManager::run()
     for (size_t i = 0; i < workers_.size(); i++) {
         Manager* w = workers_[i].get();
         auto queues = queues_;
-        auto handler = handler_;
         std::atomic<int>* live = &live_conns_;
-        threads_.emplace_back([this, w, queues, handler, i, live]() {
+        auto on_start = on_worker_start_;
+        auto on_stop = on_worker_stop_;
+        threads_.emplace_back([this, w, queues, i, live, on_start, on_stop]() {
+            // Run on_stop however this thread leaves the loop, so a binding's
+            // per-thread state is never stranded.
+            struct HookGuard {
+                const ThreadHook& stop;
+                ~HookGuard() { if (stop) stop(); }
+            } guard{on_stop};
+            if (on_start)
+                on_start();
+
             while (running_.load()) {
-                if (queues && handler)
-                    drain_worker(w->raw(), &(*queues)[i], *handler, live);
+                if (queues)
+                    drain_worker(w->raw(), &(*queues)[i], live);
                 // During a graceful drain, mark connections so they finish their
                 // in-flight response and close; poll more often so they close
                 // (and live_conns_ drops to 0) promptly.
@@ -304,6 +350,22 @@ void ShardedManager::wake_all()
     for (auto& w : workers_)
         wake_mgr(w->raw());
     wake_mgr(acceptor_.raw());
+}
+
+bool ShardedManager::wakeup(unsigned long conn_id, std::string_view data)
+{
+    // Worker ids are partitioned by the constructor (see above), so the owning
+    // worker is recoverable from the id alone -- no shared map, no lock.
+    if (workers_.empty() || conn_id == 0)
+        return false;
+    // The pipes only exist between run() and its return; wakeup() before or
+    // after that would write to MG_INVALID_SOCKET and silently do nothing, so
+    // report it instead.
+    if (!pipes_ready_.load(std::memory_order_acquire))
+        return false;
+    unsigned idx = static_cast<unsigned>(conn_id % workers_.size());
+    return nanosrv::wakeup(workers_[idx]->raw(), conn_id, data.data(),
+                           data.size());
 }
 
 void ShardedManager::stop()
