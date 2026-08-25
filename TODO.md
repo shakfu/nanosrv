@@ -1,9 +1,14 @@
 # nanosrv -- TODO
 
-Open items distilled from the code review, in priority order. Items already
+Open items distilled from the code reviews, in priority order. Items already
 completed (all High findings H1-H5; M1 body cap; M2 sharded wakeup; the stale
 header tree, README paths, and prompt shutdown; CI sanitizer/TSan/fuzz harness;
 connection idle + request-receive timeouts) are intentionally omitted.
+
+The 2026-08-24 review (formerly `REVIEW.md`) has been folded into this file:
+its findings are the "Code review" sections below, and its strategic argument
+is "Direction and specialization". Section numbers like (4.6) refer to that
+review and are kept only so older notes and commit messages still resolve.
 
 Priority tiers: **P1** security / user-facing correctness, **P2** robustness &
 production-readiness, **P3** quality, tests & portability, **P4** cosmetic /
@@ -142,9 +147,9 @@ nice-to-have.
 
 ---
 
-## From REVIEW.md -- Phase 0 (done)
+## Code review 2026-08-24 -- Phase 0 (done)
 
-The prerequisites identified in `REVIEW.md` section 7, all closed:
+The prerequisites the review identified as blocking everything else, all closed:
 
 - [x] **Licensing (4.1).** Relicensed GPL-2.0-only to match upstream Mongoose
   (`GPL-2.0-only or commercial`, no "or later" clause), replacing the GPL-3.0
@@ -174,7 +179,7 @@ The prerequisites identified in `REVIEW.md` section 7, all closed:
   `http_start_chunked()` / `http_start_sse()` in C++. Added `Connection.drain()`
   after finding that `close()` discards unflushed output.
 
-## From REVIEW.md -- still open
+## Code review 2026-08-24 -- findings
 
 - [x] **Free-threading (4.5).** `nanobind_add_module()` now passes
   `FREE_THREADED`, so the module keeps the GIL disabled on 3.13t; `cp313t`
@@ -216,8 +221,12 @@ The prerequisites identified in `REVIEW.md` section 7, all closed:
   comment, indentation, family-selection, IPv6-zone and malformed-directive
   cases are all tested without depending on the host.
 
-- [ ] **`MG_MAX_RECV_SIZE` is a compile-time 3 MB cap (4.6).** A wheel user
-  cannot raise it at all.
+- [ ] **`MG_MAX_RECV_SIZE` is a compile-time 3 MB cap (4.6).** Fine for
+  embedded; fatal for uploads, multi-image payloads, or bulk ingest -- and
+  because it is a compile-time constant rather than a knob, a wheel user cannot
+  raise it at all. Make it a per-manager runtime setting (alongside
+  `set_max_body_size`) or justify the number explicitly in the docs. Whichever
+  specialization is pursued, this needs an answer.
 
 - [x] **io_uring auto-detection (4.6).** Now opt-in via
   `-DMG_ENABLE_IO_URING=1`, and that flag actually works: it previously fell
@@ -237,9 +246,167 @@ The prerequisites identified in `REVIEW.md` section 7, all closed:
   instrumented binary where the benchmark looks for a release one). Re-measured
   on Linux, which inverts the macOS conclusions -- sharding is 4.07x mongoose
   for a trivial handler there, not 11% slower. The README carries both results
-  and says to measure per platform. Still open: nobody has re-run macOS with the
-  corrected handlers, and per-worker `SO_REUSEPORT` listeners on Linux (which
-  would avoid the accept-and-hand-off tax entirely) remain untried.
+  and says to measure per platform.
+
+- [ ] **Re-run the benchmarks on macOS with the corrected handlers.** The
+  published macOS numbers were taken when the two sharded servers replied with
+  a constant string while the other four formatted a body, so that table
+  compared different workloads and its "sharding is not worth it below ~10us of
+  handler work" conclusion is unproven. The Linux run disagrees sharply (4.07x
+  rather than 11% slower), and only a macOS re-run can say how much of that gap
+  is the platform and how much was the unequal handler.
+
+- [ ] **Try per-worker `SO_REUSEPORT` listeners on Linux.** `ShardedManager`
+  uses accept-and-hand-off because macOS does not load-balance across
+  `SO_REUSEPORT` listeners; Linux does. A per-worker listener there would drop
+  the mutex, the queue and the FD re-registration from the accept path
+  entirely. Cheap to try, and it only has to beat an already-strong 4.07x.
+
+---
+
+## Direction and specialization
+
+From the 2026-08-24 review, sections 5-7. Kept because the reasoning, not the
+conclusion, is what makes these decidable later.
+
+### Why a generic positioning loses
+
+- **The C++ core vs upstream Mongoose.** nanosrv is a subset of Mongoose with a
+  nicer C++ skin, derived from Mongoose, distributed under Mongoose's copyleft,
+  and (per its own benchmark) within a couple of percent of it single-threaded.
+  Its added value is typed callbacks, RAII and sharding -- a real but small
+  delta against a battle-tested, commercially supported library with MQTT, TLS,
+  multipart, SSI and OTA.
+- **The Python binding vs the Python server ecosystem.** No ASGI or WSGI, no
+  routing, no TLS in the shipped wheel, no HTTP/2, no static files. uvicorn,
+  granian, socketify and Robyn each dominate it on features. Two structural
+  advantages survive: it imposes no event loop on your process, and it releases
+  the GIL.
+- **The comparison lab.** No incumbent, genuinely uncommon -- and no users,
+  only readers.
+
+Those two surviving advantages are what a specialization should be built on.
+
+**Counter-framing, still worth holding onto.** It is not obvious that
+specialization is the binding constraint. The project has no users, so any
+niche chosen now is a guess; what it may actually need is a defensible licence
+(done), a Python API that can move bytes (done), and **one real deployment**
+(still missing). Treat the proposals below as "where to point once the API
+works", not as a reason to defer correctness work.
+
+### 6.1 Free-threaded, non-asyncio Python server -- ADOPTED
+
+The primary identity, and the falsification test passed. `ShardedManager` is a
+thread-per-core design, which is exactly the shape free-threading rewards and
+that asyncio-based servers cannot become. Measured 3.6x the best GIL
+configuration on a pure-Python handler and 3.9x a single-threaded `Manager` on
+a trivial one. Shipping: `FREE_THREADED` module, `cp313t` wheels, a 3.13t CI
+leg, `scripts/bench_freethreading.py`. The remaining work is ordinary
+follow-through -- 3.14t wheels, and keeping the stress coverage honest as the
+binding grows.
+
+### 6.2 Streaming inference front-end -- open
+
+An OpenAI-compatible HTTP/SSE front-end for local model servers: the network
+edge a C++ or Python inference process embeds, rather than putting FastAPI plus
+uvicorn in front of it. This is the project's own stated origin --
+`projects/mungo/mungo.h` records that the subset was "extracted for use as an
+HTTP server suitable for OpenAI-compatible API endpoints". The technical fit is
+exact: token generation is a long-lived streaming response whose handler blocks
+in native code that releases the GIL, which is where `ShardedManager` wins and
+asyncio servers are weakest. The primitives now exist (chunked writes, SSE
+helpers, `send_queue_len` for backpressure, metrics for tokens/sec).
+
+Build: a thin `nanosrv.openai` module -- `/v1/chat/completions` with
+`stream: true`, `/v1/models`, `[DONE]` framing, cancel-on-disconnect propagated
+to the generator, a documented backpressure callback. Needs the
+`MG_MAX_RECV_SIZE` item above; multimodal payloads exceed 3 MB.
+
+Risk: crowded above the transport layer (vLLM, llama.cpp's server, TGI,
+LiteLLM all ship OpenAI-compatible endpoints). The defensible pitch is narrow
+-- *embeddable* transport for people writing their own runtime, not another
+gateway -- and GPL-2.0-only is a real obstacle for that audience.
+
+Falsify cheaply: drive a toy generator through `http_write_chunk` and measure
+sustained SSE with a slow reader. If backpressure and cancel-on-disconnect are
+not clean at 1K concurrent streams, the story does not hold.
+
+### 6.3 In-process sidecar / control plane -- open, next up
+
+"The HTTP endpoint you embed in a process that already has a main loop":
+health, metrics, config and live telemetry for long-running Python and C++
+jobs, with no framework, no asyncio, and no second process. This is where the
+two structural advantages are decisive rather than marginal -- a training loop,
+a data pipeline, a game loop or a native daemon cannot host asyncio and will
+not add a FastAPI dependency tree for `/healthz`. `Manager.poll(0)` drops into
+an existing loop; the sharded runner drops into a thread.
+
+Build: a `nanosrv.sidecar` module -- one-call `serve_in_background(port)`, a
+`@route` decorator over the existing `mg_match` matcher (`projects/nanosrv/str.cpp`),
+Prometheus text rendering of `Metrics` plus user gauges, default `/healthz` and
+`/debug` endpoints, and a WebSocket topic broadcaster (the sharded `wakeup` it
+needs now exists).
+
+Risk: low technical risk, low differentiation ceiling -- someone can approximate
+it with a thread and `http.server`. The pitch has to be performance and
+non-intrusiveness, and it needs one reference deployment to be credible. It is
+the cheapest path to "someone else uses this".
+
+### 6.4 Contrarian: ship the parser, not the server -- open
+
+Extract the HTTP/1.1 and RFC 6455 parsers as an I/O-free, fuzz-hardened C++23
+library (a `picohttpparser`/`llhttp` equivalent that also does WebSocket
+framing) and let the server demonstrate it. The most credible assets here are
+the parser correctness work and the harness that proves it, and a parser is the
+piece people actually reuse: everyone writing a server already has an event
+loop they like. No threading model to argue about, no TLS gap, no GIL.
+
+Cost: smallest audience, and it abandons the sharded work and the binding as
+products. It also collides hardest with the licence -- a parser is a component
+others link into their code, which is precisely what GPL-2.0-only makes
+untenable. Pursue only alongside a clean-room or commercial resolution.
+
+### 6.5 Keep regardless: the comparison lab
+
+The multi-implementation benchmark, `ab_bench.py` and the HTML report let the
+project make performance claims that are *checkable*, and they are a legitimate
+teaching artifact about binding overhead and event-loop architecture. Do not cut
+them for focus. (The reproducibility half of this is now done: no `wrk`
+dependency, Linux numbers published, handlers equalized.)
+
+### 6.6 The alternative framing worth deciding deliberately
+
+**Stop forking Mongoose; become the C++ and Python layer on top of it.** Delete
+the duplicated core and build `Manager` / `ShardedManager` / the nanobind layer
+against upstream `mongoose.c`. Lost: control over the core. Gained: TLS that
+works, MQTT and multipart for free, upstream security fixes without a merge, a
+licensing story that is simply Mongoose's, and a maintenance burden that drops
+by most of the repo. The typed-callback and sharding work -- the parts that are
+actually original -- survive intact and become the whole product.
+
+Counter-argument: the fork exists to be small and auditable (5.5K vs 33K
+lines), which matters for embedded targets and for the fuzz story. A real
+trade, and the answer depends on the specialization: 6.4 needs the fork, 6.1
+and 6.3 do not care, 6.2 would probably prefer upstream's TLS. Worth deciding
+deliberately rather than by inertia.
+
+## Open questions -- these change the plan
+
+Cannot be resolved from the source; each materially changes the ranking above.
+
+1. **Is a commercial Mongoose licence obtainable and affordable?** If yes, 6.4
+   becomes viable and 6.2's audience opens up considerably.
+
+2. **Who is the intended user?** The repo reads as a portfolio and research
+   artifact. If that is the goal, 6.5 plus 6.1 is the right answer and the
+   licensing question matters much less than it otherwise would.
+
+3. **Was the OpenAI-endpoint note in `projects/mungo/mungo.h` the original
+   motivation, or a leftover?** If it is still live, 6.2 should be reconsidered
+   ahead of 6.3.
+
+4. **Is Windows a real target?** It constrains the free-threading and
+   `SO_REUSEPORT` work and roughly doubles the cost of 6.1.
 
 ---
 
