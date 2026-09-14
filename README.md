@@ -7,22 +7,25 @@ nanosrv is a lightweight, single-file C++ server library (based on [Mongoose](ht
 ## Features
 
 - **HTTP server** with typed request/response handlers
+
 - **WebSocket** support (text, binary, ping/pong, upgrade) on both event loops
-- **Binary-safe payloads**: request bodies and WebSocket frames arrive as `bytes`;
-  every send accepts `bytes`, `bytearray`, `memoryview` or `str`
-- **Streamed responses**: chunked writes and Server-Sent Events from Python
-  (`start_chunked`, `write_chunk`, `start_sse`, `sse_send`), with
-  `send_queue_len` for backpressure
+
+- **Binary-safe payloads**: request bodies and WebSocket frames arrive as `bytes`; every send accepts `bytes`, `bytearray`, `memoryview` or `str`
+
+- **Streamed responses**: chunked writes and Server-Sent Events from Python (`start_chunked`, `write_chunk`, `start_sse`, `sse_send`), with `send_queue_len` for backpressure
+
 - **Single-threaded** (`Manager`) and **multi-threaded** (`ShardedManager`) event loops
+
 - **URL parsing**, **Base64** encode/decode, **URL** encode/decode
+
 - **JSON** path-based extraction (string, number, integer, boolean)
+
 - **Configurable logging** levels
-- **Connection hardening**: idle timeout (`set_idle_timeout`), request-receive deadline
-  (`set_request_timeout`), client connect timeout (`set_connect_timeout`), request-body
-  cap with 413 (`set_max_body_size`), max-connection cap (`set_max_connections`), and
-  send-buffer watermark (`set_max_send_buffer`)
-- **Observability**: cumulative counters and a live connection gauge (`Manager.metrics`,
-  `ShardedManager.metrics`)
+
+- **Connection hardening**: idle timeout (`set_idle_timeout`), request-receive deadline (`set_request_timeout`), client connect timeout (`set_connect_timeout`), request-body cap with 413 (`set_max_body_size`), max-connection cap (`set_max_connections`), and send-buffer watermark (`set_max_send_buffer`)
+
+- **Observability**: cumulative counters and a live connection gauge (`Manager.metrics`, `ShardedManager.metrics`)
+
 - GIL-releasing `poll()` and `run()` for responsive Python integration
 
 ## Server Implementations
@@ -127,9 +130,7 @@ mgr = nanosrv.Manager()
 mgr.http_listen_event("http://0.0.0.0:8080", handler)
 ```
 
-`ShardedManager.http_listen_event()` takes the same handler, so WebSocket works
-on the multi-threaded loop too. The handler runs on the worker thread that owns
-the connection, so it must be thread-safe.
+`ShardedManager.http_listen_event()` takes the same handler, so WebSocket works on the multi-threaded loop too. The handler runs on the worker thread that owns the connection, so it must be thread-safe.
 
 ### Streaming a response
 
@@ -143,14 +144,11 @@ def handler(conn, msg):
     conn.write_chunk(b"")                   # terminating chunk
 ```
 
-For Server-Sent Events, `start_sse()` sends the event-stream headers and
-`sse_send(data, event=..., id=...)` emits one correctly framed event.
+For Server-Sent Events, `start_sse()` sends the event-stream headers and `sse_send(data, event=..., id=...)` emits one correctly framed event.
 
 ### Acting on a connection later
 
-The `Connection` handed to a handler is valid only during that call. To push to
-it afterwards, keep `conn.id` and use `wakeup()` from any thread -- the handler
-is called again with `Event.Wakeup` and your payload as `bytes`:
+The `Connection` handed to a handler is valid only during that call. To push to it afterwards, keep `conn.id` and use `wakeup()` from any thread -- the handler is called again with `Event.Wakeup` and your payload as `bytes`:
 
 ```python
 mgr.wakeup(conn_id, b"payload")   # Manager and ShardedManager both
@@ -206,30 +204,13 @@ Wire payloads cross as **bytes**; protocol metadata crosses as **str**.
 | `method`, `uri`, `query`, `header()`, `credentials()` | `str` | Decoded with `surrogateescape`, so a malformed request cannot raise inside a handler. Lossless: `s.encode("utf-8", "surrogateescape")` recovers the raw bytes |
 | Any send argument | `bytes` \| `bytearray` \| `memoryview` \| `str` | A `str` is encoded UTF-8 |
 
-This is a change from v0.2.0 and earlier, where every payload was `str`: a
-binary body or WebSocket frame raised `UnicodeDecodeError` inside the handler,
-and no send path accepted `bytes`. Handlers written against that behaviour need
-`msg.text` wherever they used `msg.body` as text.
+This is a change from v0.2.0 and earlier, where every payload was `str`: a binary body or WebSocket frame raised `UnicodeDecodeError` inside the handler, and no send path accepted `bytes`. Handlers written against that behaviour need `msg.text` wherever they used `msg.body` as text.
 
-Note that `close()` is immediate and discards whatever is still buffered for
-sending; after `send_bytes()` or a streamed response, use `drain()` to close
-once the output has been flushed.
+Note that `close()` is immediate and discards whatever is still buffered for sending; after `send_bytes()` or a streamed response, use `drain()` to close once the output has been flushed.
 
 #### Callback object lifetime
 
-The `Connection`, `HttpMessage`, and `WsMessage` objects handed to a handler are
-**borrowed views valid only for the duration of that call**. They point into
-buffers owned by the event loop, which reuses or frees them as soon as the
-handler returns. Do not stash one and touch it later (from another thread, a
-timer, or a subsequent event) -- read what you need during the call, and copy
-out any bytes you must keep (e.g. `bytes(msg.body)` / `std::string(hm.body...)`).
-The Python bindings enforce this: a stored `Connection`/`HttpMessage` raises if
-used after the callback returns (see `tests/test_nanosrv.py`,
-`TestCallbackObjectLifetime`). To act on a connection later, keep `conn.id` and
-call `wakeup(id, data)` on the `Manager` or `ShardedManager` from any thread;
-the handler is invoked again with `Event.Wakeup` and the payload as `bytes`. The long-lived exception is `ConnectionRef`, the
-non-owning handle returned by `http_listen()`, which stays valid until its
-listener closes.
+The `Connection`, `HttpMessage`, and `WsMessage` objects handed to a handler are **borrowed views valid only for the duration of that call**. They point into buffers owned by the event loop, which reuses or frees them as soon as the handler returns. Do not stash one and touch it later (from another thread, a timer, or a subsequent event) -- read what you need during the call, and copy out any bytes you must keep (e.g. `bytes(msg.body)` / `std::string(hm.body...)`). The Python bindings enforce this: a stored `Connection`/`HttpMessage` raises if used after the callback returns (see `tests/test_nanosrv.py`, `TestCallbackObjectLifetime`). To act on a connection later, keep `conn.id` and call `wakeup(id, data)` on the `Manager` or `ShardedManager` from any thread; the handler is invoked again with `Event.Wakeup` and the payload as `bytes`. The long-lived exception is `ConnectionRef`, the non-owning handle returned by `http_listen()`, which stays valid until its listener closes.
 
 ### Enums
 
@@ -255,46 +236,19 @@ listener closes.
 
 ### Limitations & security notes
 
-- **TLS is opt-in (C++ build).** The default build links a no-op TLS stub, so
-  `https://` and `wss://` are not supported: `tls_available()` returns `False`,
-  and calling `http_listen` / `http_listen_event` with a TLS URL raises
-  `RuntimeError` immediately rather than failing later at the handshake. An
-  mbedTLS backend can be enabled when building the C++ library/server with
-  `-DNANOSRV_TLS=mbed` (see Build Targets), after which `tls_available()` is
-  `True` and TLS listeners/clients work. The Python wheel currently ships with
-  the stub (no TLS); terminate TLS in front of nanosrv (e.g. a reverse proxy)
-  when using the bindings.
-- **IP ACLs are not enforced automatically.** The library provides
-  `check_ip_acl()` (C++), which now matches both IPv4 and IPv6 with bitwise
-  prefix comparison -- a previous version returned early for IPv6, so a
-  restrictive ACL silently failed open for IPv6 peers. It is a building block:
-  no listener applies an ACL on its own yet, so wire it into your handler if you
-  need address filtering.
-- **Not yet hardened for hostile networks.** See the connection-hardening knobs
-  (`set_idle_timeout`, `set_request_timeout`, `set_connect_timeout`,
-  `set_max_body_size`, `set_max_connections`, `set_max_send_buffer`) and the
-  graceful-drain support, but treat exposure to untrusted clients as
-  experimental. See [SECURITY.md](SECURITY.md) for the current threat-model
-  posture and how to report a vulnerability.
-- **DNS uses the system resolver.** Outbound name resolution reads the first
-  `nameserver` entry of each family from `/etc/resolv.conf` at startup, falling
-  back to a public resolver only when that file names none (and on Windows,
-  which has no such file). Earlier versions always used a hardcoded
-  `8.8.8.8`, which ignored split-horizon DNS, container and VPN resolvers, and
-  sent every query off the host. Override by assigning `mgr->dns4.url` /
-  `dns6.url` after construction.
+- **TLS is opt-in (C++ build).** The default build links a no-op TLS stub, so `https://` and `wss://` are not supported: `tls_available()` returns `False`, and calling `http_listen` / `http_listen_event` with a TLS URL raises `RuntimeError` immediately rather than failing later at the handshake. An mbedTLS backend can be enabled when building the C++ library/server with `-DNANOSRV_TLS=mbed` (see Build Targets), after which `tls_available()` is `True` and TLS listeners/clients work. The Python wheel currently ships with the stub (no TLS); terminate TLS in front of nanosrv (e.g. a reverse proxy) when using the bindings.
 
-- **Observability.** `Manager.metrics` / `ShardedManager.metrics` expose
-  cumulative counters (accepted, closed, errors, bytes read/written) plus a live
-  connection gauge for health/metrics endpoints.
+- **IP ACLs are not enforced automatically.** The library provides `check_ip_acl()` (C++), which now matches both IPv4 and IPv6 with bitwise prefix comparison -- a previous version returned early for IPv6, so a restrictive ACL silently failed open for IPv6 peers. It is a building block: no listener applies an ACL on its own yet, so wire it into your handler if you need address filtering.
+
+- **Not yet hardened for hostile networks.** See the connection-hardening knobs (`set_idle_timeout`, `set_request_timeout`, `set_connect_timeout`, `set_max_body_size`, `set_max_connections`, `set_max_send_buffer`) and the graceful-drain support, but treat exposure to untrusted clients as experimental. See [SECURITY.md](SECURITY.md) for the current threat-model posture and how to report a vulnerability.
+
+- **DNS uses the system resolver.** Outbound name resolution reads the first `nameserver` entry of each family from `/etc/resolv.conf` at startup, falling back to a public resolver only when that file names none (and on Windows, which has no such file). Earlier versions always used a hardcoded `8.8.8.8`, which ignored split-horizon DNS, container and VPN resolvers, and sent every query off the host. Override by assigning `mgr->dns4.url` / `dns6.url` after construction.
+
+- **Observability.** `Manager.metrics` / `ShardedManager.metrics` expose cumulative counters (accepted, closed, errors, bytes read/written) plus a live connection gauge for health/metrics endpoints.
 
 ### Performance
 
-Benchmarked on Linux x86_64 (i7-12650H, 16 threads) with 100 connections for
-10s. **Every server runs the same handler** (parse the request, format the
-method and URI into the response body) -- the two sharded servers previously
-replied with a constant string while the other four formatted a body, so the
-old comparison measured different workloads.
+Benchmarked on Linux x86_64 (i7-12650H, 16 threads) with 100 connections for 10s. **Every server runs the same handler** (parse the request, format the method and URI into the response body) -- the two sharded servers previously replied with a constant string while the other four formatted a body, so the old comparison measured different workloads.
 
 #### Trivial handler (no CPU work)
 
@@ -308,26 +262,11 @@ old comparison measured different workloads.
 | nanosrv Python ShardedManager (GIL) | 221,723 | 451us | 1.17ms | +4% |
 | nanosrv Python ShardedManager (free-threaded) | 772,108 | 129us | 310us | **3.60x** |
 
-The three single-threaded servers land within 3% of each other: extracting
-mungo from Mongoose costs nothing, and the C++ wrapper's `std::function`
-dispatch is inside the noise. The sharded servers scale with cores -- 4.07x for
-C++, 3.60x for Python on a free-threaded interpreter. The Python `Manager`
-retains 97% of mongoose's throughput, because at this request rate the work is
-dominated by the event loop and parser rather than by the callback.
+The three single-threaded servers land within 3% of each other: extracting mungo from Mongoose costs nothing, and the C++ wrapper's `std::function` dispatch is inside the noise. The sharded servers scale with cores -- 4.07x for C++, 3.60x for Python on a free-threaded interpreter. The Python `Manager` retains 97% of mongoose's throughput, because at this request rate the work is dominated by the event loop and parser rather than by the callback.
 
-The GIL-bound Python `ShardedManager` reaches C-server throughput but no
-further: its 16 workers serialise on the GIL to run the handler, which is
-visible in its p99 (1.17ms, more than double any other server) -- throughput is
-fine, tail latency is where the contention shows up. On a free-threaded
-interpreter that constraint disappears.
+The GIL-bound Python `ShardedManager` reaches C-server throughput but no further: its 16 workers serialise on the GIL to run the handler, which is visible in its p99 (1.17ms, more than double any other server) -- throughput is fine, tail latency is where the contention shows up. On a free-threaded interpreter that constraint disappears.
 
-**These numbers are platform-dependent, and earlier macOS measurements said the
-opposite about sharding.** On an 8-core M2 the sharded C++ server measured 11%
-*slower* than mongoose for a trivial handler, and the accept-and-hand-off tax
-was cited as the reason. That conclusion does not hold on Linux, where epoll and
-16 hardware threads turn the same design into a 4x win. If you are choosing
-between `Manager` and `ShardedManager`, measure on your target platform --
-`make bench` does exactly this run.
+**These numbers are platform-dependent, and earlier macOS measurements said the opposite about sharding.** On an 8-core M2 the sharded C++ server measured 11% *slower* than mongoose for a trivial handler, and the accept-and-hand-off tax was cited as the reason. That conclusion does not hold on Linux, where epoll and 16 hardware threads turn the same design into a 4x win. If you are choosing between `Manager` and `ShardedManager`, measure on your target platform -- `make bench` does exactly this run.
 
 #### CPU-bound handler (busy spin)
 
@@ -341,22 +280,13 @@ The `--busy <us>` flag on the C++ servers adds a CPU spin loop to the handler, s
 | 100 | 9,596 | 132,567 | **13.8x** |
 | 500 | 1,977 | 30,003 | **15.2x** |
 
-Sharding wins at every level of handler work on this machine, and the advantage
-widens as the handler gets heavier: 15.2x at 500us (realistic for a database
-query or a large JSON response) across 16 workers, which is close to linear.
-There is no crossover point here -- on 8-core macOS there was one, at around
-5-10us of handler CPU time. Measure on your own hardware.
+Sharding wins at every level of handler work on this machine, and the advantage widens as the handler gets heavier: 15.2x at 500us (realistic for a database query or a large JSON response) across 16 workers, which is close to linear. There is no crossover point here -- on 8-core macOS there was one, at around 5-10us of handler CPU time. Measure on your own hardware.
 
 #### Free-threaded CPython (3.13t and later)
 
-`ShardedManager` is a thread-per-core design, so the GIL is precisely what
-holds it back: with a pure-Python handler, workers contend to run one handler
-at a time and adding workers makes throughput *worse*. On a free-threaded
-interpreter that inverts. The wheel opts in (nanobind's `FREE_THREADED`), so
-`sys._is_gil_enabled()` stays `False` after importing nanosrv.
+`ShardedManager` is a thread-per-core design, so the GIL is precisely what holds it back: with a pure-Python handler, workers contend to run one handler at a time and adding workers makes throughput *worse*. On a free-threaded interpreter that inverts. The wheel opts in (nanobind's `FREE_THREADED`), so `sys._is_gil_enabled()` stays `False` after importing nanosrv.
 
-Measured on Linux x86_64 (i7-12650H, 16 threads), the same CPython 3.13.15
-built both ways, 64 connections, handler doing ~120us of pure-Python work:
+Measured on Linux x86_64 (i7-12650H, 16 threads), the same CPython 3.13.15 built both ways, 64 connections, handler doing ~120us of pure-Python work:
 
 | Workers | 3.13 (GIL) | 3.13t (free-threaded) |
 |---|---|---|
@@ -366,30 +296,18 @@ built both ways, 64 connections, handler doing ~120us of pure-Python work:
 | 8 | 7,151 rps | 30,832 rps |
 | 16 | 6,726 rps | **33,296 rps** |
 
-Best configuration to best configuration, that is **3.6x**. The GIL column
-*degrades* as workers are added, which is what a thread-per-core design under
-a global lock must do. Reproduce with:
+Best configuration to best configuration, that is **3.6x**. The GIL column *degrades* as workers are added, which is what a thread-per-core design under a global lock must do. Reproduce with:
 
 ```bash
 uv python install 3.13t
 uv run python scripts/bench_freethreading.py
 ```
 
-Free-threaded CPython executes single-threaded Python roughly 30% slower
-(the same handler costs 119.5us there against 93us under the GIL), so one
-worker is slower and the crossover is at two.
+Free-threaded CPython executes single-threaded Python roughly 30% slower (the same handler costs 119.5us there against 93us under the GIL), so one worker is slower and the crossover is at two.
 
-The same inversion shows up with a trivial handler, where the work is nearly
-all event loop and parser: against a single-threaded `Manager` at 195,584
-req/s, the GIL build peaks at 1.56x (2 workers) and decays to 1.03x by 16,
-while the free-threaded build reaches 3.88x at 16 workers.
+The same inversion shows up with a trivial handler, where the work is nearly all event loop and parser: against a single-threaded `Manager` at 195,584 req/s, the GIL build peaks at 1.56x (2 workers) and decays to 1.03x by 16, while the free-threaded build reaches 3.88x at 16 workers.
 
-**Your handler really is concurrent.** With no GIL, handlers on different
-workers run at the same instant rather than interleaving, so shared state in
-your handler needs its own locking. The bindings and the C++ core are safe: the
-test suite passes on 3.13t, and a 20-second stress run (2.7M HTTP requests,
-1.6M WebSocket echoes, 56K cross-thread wakeups across 8 workers,
-payload-verified) completes with zero errors.
+**Your handler really is concurrent.** With no GIL, handlers on different workers run at the same instant rather than interleaving, so shared state in your handler needs its own locking. The bindings and the C++ core are safe: the test suite passes on 3.13t, and a 20-second stress run (2.7M HTTP requests, 1.6M WebSocket echoes, 56K cross-thread wakeups across 8 workers, payload-verified) completes with zero errors.
 
 #### Run benchmarks
 
@@ -397,11 +315,7 @@ payload-verified) completes with zero errors.
 make bench    # builds everything, runs all benchmarks, generates HTML report
 ```
 
-`make bench` uses [wrk](https://github.com/wg/wrk) when it is installed and
-otherwise builds the bundled `scripts/loadgen.c` (a threaded keep-alive load
-generator, needing only a C compiler), so the benchmarks run on a bare machine.
-Set `NANOSRV_FT_PYTHON` to a free-threaded interpreter that has nanosrv
-installed to add the free-threaded Python row.
+`make bench` uses [wrk](https://github.com/wg/wrk) when it is installed and otherwise builds the bundled `scripts/loadgen.c` (a threaded keep-alive load generator, needing only a C compiler), so the benchmarks run on a bare machine. Set `NANOSRV_FT_PYTHON` to a free-threaded interpreter that has nanosrv installed to add the free-threaded Python row.
 
 ```bash
 # GIL vs free-threaded scaling for ShardedManager (needs `uv python install 3.13t`)
@@ -470,12 +384,7 @@ make bench          # run wrk benchmarks (builds everything first)
 
 ### Poller backend
 
-Linux uses `epoll`, BSD and macOS use `kqueue`, and everything else falls back
-to `poll()`. `io_uring` is available with `-DMG_ENABLE_IO_URING=1` but is not
-recommended yet: it is used in readiness (`POLL_ADD`) mode rather than for
-submitted async I/O, so it offers no throughput advantage over epoll. It used
-to switch itself on whenever `<liburing.h>` happened to be installed, which
-made the poller a property of the build machine rather than of the build.
+Linux uses `epoll`, BSD and macOS use `kqueue`, and everything else falls back to `poll()`. `io_uring` is available with `-DMG_ENABLE_IO_URING=1` but is not recommended yet: it is used in readiness (`POLL_ADD`) mode rather than for submitted async I/O, so it offers no throughput advantage over epoll. It used to switch itself on whenever `<liburing.h>` happened to be installed, which made the poller a property of the build machine rather than of the build.
 
 ### Runtime environment variables
 
@@ -485,19 +394,14 @@ made the poller a property of the build machine rather than of the build.
 
 ### TLS backend (opt-in)
 
-TLS is off by default. To build the C++ library and servers with TLS, configure
-the CMake project with the mbedTLS backend:
+TLS is off by default. To build the C++ library and servers with TLS, configure the CMake project with the mbedTLS backend:
 
 ```text
 cmake -B build/cmake -S projects -DNANOSRV_TLS=mbed
 cmake --build build/cmake
 ```
 
-mbedTLS is not vendored. By default it is fetched at configure time via CMake
-`FetchContent`, pinned to the v3.6.6 release commit and cached under the build
-tree (so the first configure of the `mbed` backend needs network access; the
-default `none` build never fetches). `NANOSRV_MBEDTLS_PROVIDER` controls the
-source:
+mbedTLS is not vendored. By default it is fetched at configure time via CMake `FetchContent`, pinned to the v3.6.6 release commit and cached under the build tree (so the first configure of the `mbed` backend needs network access; the default `none` build never fetches). `NANOSRV_MBEDTLS_PROVIDER` controls the source:
 
 ```text
 -DNANOSRV_MBEDTLS_PROVIDER=auto     # use an installed mbedTLS if found, else fetch (default)
@@ -505,20 +409,10 @@ source:
 -DNANOSRV_MBEDTLS_PROVIDER=fetch    # always fetch the pinned commit
 ```
 
-An installed mbedTLS is accepted only in the range `>= 3.6, < 4.0` (the backend
-targets the mbedTLS 3.x API; 4.x is an API break and is skipped). With the
-backend enabled, the C++ test suite adds end-to-end TLS handshake and mutual-TLS
-(client-certificate) tests.
+An installed mbedTLS is accepted only in the range `>= 3.6, < 4.0` (the backend targets the mbedTLS 3.x API; 4.x is an API break and is skipped). With the backend enabled, the C++ test suite adds end-to-end TLS handshake and mutual-TLS (client-certificate) tests.
 
 ## License
 
-**GPL-2.0-only.** nanosrv is a derivative work of
-[Mongoose 7.21](https://github.com/cesanta/mongoose), which is dual-licensed
-`GPL-2.0-only or commercial`. GPL-2.0-only has no "or any later version" clause,
-so the derived code cannot be redistributed under GPL-3.0, MIT, or any other
-terms. See [LICENSE](LICENSE) for the text and
-[PROVENANCE.md](PROVENANCE.md) for a file-by-file account of what is inherited
-from upstream and what is original.
+**GPL-2.0-only.** nanosrv is a derivative work of [Mongoose 7.21](https://github.com/cesanta/mongoose), which is dual-licensed `GPL-2.0-only or commercial`. GPL-2.0-only has no "or any later version" clause, so the derived code cannot be redistributed under GPL-3.0, MIT, or any other terms. See [LICENSE](LICENSE) for the text and [PROVENANCE.md](PROVENANCE.md) for a file-by-file account of what is inherited from upstream and what is original.
 
-If you need non-copyleft terms, obtain a commercial Mongoose licence from
-<https://mongoose.ws/licensing/> first; it covers the upstream portion only.
+If you need non-copyleft terms, obtain a commercial Mongoose licence from <https://mongoose.ws/licensing/> first; it covers the upstream portion only.
