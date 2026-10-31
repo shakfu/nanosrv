@@ -8,13 +8,13 @@ Findings from the 2026-10-04 review. Tags give the evidence behind each item:
 
 ## Critical
 
-- [ ] **HTTP request smuggling via POST/PUT without Content-Length.** `projects/nanosrv/http.cpp:714` adds `n` to `ofs`, and `:783` adds `n + body.len` again. The first `n` bytes of the next pipelined request are skipped, so a body can carry a hidden request. Example: `POST /a` (no CL), then `GET /pub` with a body containing `GET /admin` -> server serves `/admin`. Fix: delete `ofs += n` at `:714`. The 411 in that branch is also unreachable, because `http_parse` sets `body.len = 0` for requests. `[repro]` `[upstream]`
+- [x] **HTTP request smuggling via POST/PUT without Content-Length.** Fixed in `4b3adfd`. `projects/nanosrv/http.cpp:714` adds `n` to `ofs`, and `:783` adds `n + body.len` again. The first `n` bytes of the next pipelined request are skipped, so a body can carry a hidden request. Example: `POST /a` (no CL), then `GET /pub` with a body containing `GET /admin` -> server serves `/admin`. Fix: delete `ofs += n` at `:714`. The 411 in that branch is also unreachable, because `http_parse` sets `body.len = 0` for requests. `[repro]` `[upstream]`
 
-- [ ] **One spoofed datagram redirects all DNS queries.** `sock.cpp:504-516`, `:331-333`. The resolver UDP socket is not `connect()`ed. `recv_raw` copies every sender into `c->rem`, and later queries `sendto` that address. An attacker can then read the txnid and answer every lookup. Fix: `connect()` the UDP socket, or drop datagrams whose source is not the configured resolver. `[repro]` `[upstream]`
+- [x] **One spoofed datagram redirects all DNS queries.** Fixed in `4b3adfd`. `sock.cpp:504-516`, `:331-333`. The resolver UDP socket is not `connect()`ed. `recv_raw` copies every sender into `c->rem`, and later queries `sendto` that address. An attacker can then read the txnid and answer every lookup. Fix: `connect()` the UDP socket, or drop datagrams whose source is not the configured resolver. `[repro]` `[upstream]`
 
 ## High
 
-- [ ] **Idle timeout closes connections that just received data.** `sock.cpp:1009`, `:125`, `:1048-1050`. `now` is read once per poll; `iolog` then sets `last_active = millis()`, which can be later. `now - last_active` wraps to ~2^64 and exceeds any timeout. The buffered reply is discarded. 60 of 80 concurrent requests failed with a 2 ms handler. `[repro]`
+- [ ] **Idle timeout closes connections that just received data.** `sock.cpp:1017`, `:125`, `:1056-1058`. `now` is read once per poll; `iolog` then sets `last_active = millis()`, which can be later. `now - last_active` wraps to ~2^64 and exceeds any timeout. The buffered reply is discarded. 60 of 80 concurrent requests failed with a 2 ms handler. `[repro]`
 
 - [ ] **A Python handler exception permanently disables a sharded worker.** `src/nanosrv/_core.cpp:841-843`, `:881-883` (same pattern at `:705-707`, `:750-752`). `e.restore()` leaves the error set on a long-lived thread state. Every later callback on that worker fails silently; with `ShardedManager(1)` all later requests hang. On `Manager`, the next `poll()` raises `SystemError`. The client gets no response and the connection stays open. Fix: `e.discard_as_unraisable()`, then reply 500 or close. `[repro]`
 
@@ -28,7 +28,7 @@ Findings from the 2026-10-04 review. Tags give the evidence behind each item:
 
 - [ ] **TLS send reports unencrypted bytes as sent.** `tls_mbed.cpp:302-308`. On `MBEDTLS_ERR_SSL_WANT_WRITE`, `tls_send` returns `len`, but mbedTLS only took one record (16 KB). `iolog` deletes the rest from `c->send`. Responses over 16 KB to a slow client are truncated. `[read]`
 
-- [ ] **io_uring backend (opt-in) is unsafe.** `sock.cpp:720-772`. `[read]`
+- [ ] **io_uring backend (opt-in) is unsafe.** `sock.cpp:728-780`. `[read]`
   - Each `iotest` adds a new `POLL_ADD` per connection; old ones are never cancelled.
   - `user_data = c` is never revoked, so a completion after `close_conn` writes into freed or pooled memory.
   - Pending polls keep the file open, so `close()` sends no FIN.
@@ -39,21 +39,21 @@ Findings from the 2026-10-04 review. Tags give the evidence behind each item:
 
 - [ ] **Chunk-size line split across reads kills the request.** `http.cpp:615-624` (`skip_chunk`). An incomplete size line (`fff`, `100\r`) returns -1 instead of 0, so the connection closes. Any TCP segment boundary inside a size line triggers it. `len < i + 1` also lets `buf[i + 1]` read 1 byte past the data. Fix: return 0 when `i + 2 > len`. `[repro]` `[upstream]`
 
-- [ ] **411 reply repeats every poll.** `http.cpp:639-641`, `:715-728`. A request line starting `HTTP/` is parsed as a response with `body.len = ~0`. The 411 path neither drains nor discards, so the POLL re-parse (#2796) appends another 411 each tick. 16 copies in 0.4 s. `MG_EV_HTTP_HDRS` also re-fires each poll for any partially buffered body. Fix: discard and drain after 411. `[repro]` `[upstream]`
+- [ ] **411 reply repeats every poll.** `http.cpp:639-641`, `:714-727`. A request line starting `HTTP/` is parsed as a response with `body.len = ~0`. The 411 path neither drains nor discards, so the POLL re-parse (#2796) appends another 411 each tick. 16 copies in 0.4 s. `MG_EV_HTTP_HDRS` also re-fires each poll for any partially buffered body. Fix: discard and drain after 411. `[repro]` `[upstream]`
 
 - [ ] **Truncated body delivered as complete on close.** `http.cpp:681-686`. On `MG_EV_CLOSE`, `body.len` is recomputed from buffered bytes even when Content-Length was declared. `CL: 100` + 3 bytes + `SHUT_WR` -> handler sees a 3-byte body. Fix: only recompute when no CL was declared. `[repro]` `[upstream]`
 
-- [ ] **Buffered TLS tail discarded on drain/close.** `tls_mbed.cpp:302-308` with `sock.cpp:1038-1044`, `:141-143`. `send.len` can reach 0 while mbedTLS still holds ciphertext. The drain check ignores `is_tls_throttled`, and `MG_EPOLL_MOD(c, 0)` drops EPOLLOUT. Up to 16 KB of a reply is lost. `[read]`
+- [ ] **Buffered TLS tail discarded on drain/close.** `tls_mbed.cpp:302-308` with `sock.cpp:1046-1052`, `:141-143`. `send.len` can reach 0 while mbedTLS still holds ciphertext. The drain check ignores `is_tls_throttled`, and `MG_EPOLL_MOD(c, 0)` drops EPOLLOUT. Up to 16 KB of a reply is lost. `[read]`
 
-- [ ] **TLS fail-closed holds only for the stub backend.** `net.cpp:271`, `sock.cpp:606-607`, `tls_mbed.cpp:202-204`. With `-DNANOSRV_TLS=mbed`, an `https://` listener whose handler does not call `tls_init` on accept serves cleartext. A client `TlsOpts` with empty `ca` silently uses `VERIFY_NONE`. Either fix or document in SECURITY.md. `[read]`
+- [ ] **TLS fail-closed holds only for the stub backend.** `net.cpp:271`, `sock.cpp:614-615`, `tls_mbed.cpp:202-204`. With `-DNANOSRV_TLS=mbed`, an `https://` listener whose handler does not call `tls_init` on accept serves cleartext. A client `TlsOpts` with empty `ca` silently uses `VERIFY_NONE`. Either fix or document in SECURITY.md. `[read]`
 
 - [ ] **`SO_REUSEPORT` on every listener.** `sock.cpp:289-294`. Not in upstream. Binding a port already in use succeeds instead of `EADDRINUSE`; a second process under the same UID silently takes a share of connections. Sharding does not use it. `[repro]`
 
-- [ ] **kqueue and io_uring reject accepted fds >= `FD_SETSIZE`.** `sock.cpp:567-572`. The guard excludes only POLL and EPOLL. On macOS with a raised `ulimit -n`, concurrency caps at ~1000. `[read]`
+- [ ] **kqueue and io_uring reject accepted fds >= `FD_SETSIZE`.** `sock.cpp:575-580`. The guard excludes only POLL and EPOLL. On macOS with a raised `ulimit -n`, concurrency caps at ~1000. `[read]`
 
-- [ ] **`start_drain()` drops requests whose reply is deferred.** `sock.cpp:1043-1044`, `net.hpp:428-435`. Draining closes on `send.len == 0` and ignores `is_resp`. A handler using the documented `wakeup` pattern loses its reply. `[repro]`
+- [ ] **`start_drain()` drops requests whose reply is deferred.** `sock.cpp:1051-1052`, `net.hpp:428-435`. Draining closes on `send.len == 0` and ignores `is_resp`. A handler using the documented `wakeup` pattern loses its reply. `[repro]`
 
-- [ ] **Wakeup payloads over ~16 KB are truncated; the bool does not mean delivery.** `sock.cpp:938-1000`, `:363`. The UDP socketpair is read once into at most `MG_IO_SIZE`; 20000 and 60000 bytes both arrive as 16376. `wakeup(999999, ...)` and wakeup to a closed connection both return `True`. Contradicts `net.hpp:363`, the Python docstrings, and the CHANGELOG. Fix the behaviour or the docs; document a size limit. `[repro]`
+- [ ] **Wakeup payloads over ~16 KB are truncated; the bool does not mean delivery.** `sock.cpp:946-1008`, `:371`. The UDP socketpair is read once into at most `MG_IO_SIZE`; 20000 and 60000 bytes both arrive as 16376. `wakeup(999999, ...)` and wakeup to a closed connection both return `True`. Contradicts `net.hpp:363`, the Python docstrings, and the CHANGELOG. Fix the behaviour or the docs; document a size limit. `[repro]`
 
 - [ ] **`ShardedManager(1)` delivers spurious `Wakeup` events.** `sharded.cpp:45`, `:52`, `:134`. Internal `WAKE_ID = 1` collides with worker 0's first connection id when N = 1. Every hand-off, `stop()` or `drain()` sends that connection `Event.Wakeup` with `b''`. `[repro]`
 
@@ -75,11 +75,15 @@ Findings from the 2026-10-04 review. Tags give the evidence behind each item:
 
 - [ ] **IPv6 zone in resolv.conf breaks DNS; with `use_dns6` it crashes.** `util.cpp` (`parse_resolv_conf`), `net.cpp:130` (`aton6`), `dns.cpp:278-279`. `aton6` accepts only a numeric scope; `nameserver fe80::1%eth0` fails to parse. With `use_dns6 = true`, `dnsc_init` -> `connect` -> `resolve` -> `sendnsreq` recurses until segfault. The `parse_resolv_conf` comment claims zone support. `[repro]`
 
+- [x] **DNS replies are matched on txnid alone.** The reply's question name is now compared. The source port still appears fixed while the socket is open; a new socket per query would randomize it. `[read]`
+
 ## Low
 
-- [ ] **`url_encode(std::string_view)` returns `""` for some inputs.** `http.cpp:976-983` with `:830`. The wrapper allocates `3n + 1`; the bound `n + 4 >= len` needs `3n + 2`. `url_encode("a")`, `"  "`, `"/ "` -> `""`. Python `nanosrv.url_encode` binds this overload (`_core.cpp:972`). Port regression. `[repro]`
+- [ ] **POST/PUT 411 branch is dead code.** `http.cpp:712-713`. `http_parse` sets `body.len = 0` for requests without Content-Length, so `require_content_len` stays false. Delete the check. `[read]`
 
-- [ ] **`http_get_header_var` over-reads and substring-matches.** `http.cpp:885-892`. An unterminated quoted value returns 1 byte past the input. The name match has no boundary check, so cookie `evil_access_token=x` matches `access_token` in `http_creds` (`:863`). `[repro]` `[upstream]`
+- [ ] **`url_encode(std::string_view)` returns `""` for some inputs.** `http.cpp:975-982` with `:829`. The wrapper allocates `3n + 1`; the bound `n + 4 >= len` needs `3n + 2`. `url_encode("a")`, `"  "`, `"/ "` -> `""`. Python `nanosrv.url_encode` binds this overload (`_core.cpp:972`). Port regression. `[repro]`
+
+- [ ] **`http_get_header_var` over-reads and substring-matches.** `http.cpp:884-891`. An unterminated quoted value returns 1 byte past the input. The name match has no boundary check, so cookie `evil_access_token=x` matches `access_token` in `http_creds` (`:862`). `[repro]` `[upstream]`
 
 - [ ] **WebSocket client accepts a malformed handshake.** `ws.cpp:175`. `if (http_parse(...))` treats -1 and -2 (`MG_HTTP_TOO_MANY_HEADERS`) as success; `MG_EV_WS_OPEN` fires with a partly zeroed `hm`. `[read]` `[upstream]`
 
@@ -110,7 +114,7 @@ Findings from the 2026-10-04 review. Tags give the evidence behind each item:
 
 - [ ] **`stat_bytes_read` counts decrypted bytes under TLS,** not wire bytes as its comment says. `[read]`
 
-- [ ] **Chunked body over `max_body_size` is rejected only after full buffering** (up to 3 MB). `http.cpp:769`. `[read]`
+- [ ] **Chunked body over `max_body_size` is rejected only after full buffering** (up to 3 MB). `http.cpp:770`. `[read]`
 
 - [ ] **Stub and doc gaps.** `[read]`
   - `HttpMessage.method`/`uri`/`query` are typed `-> object` (no `nb::sig`).

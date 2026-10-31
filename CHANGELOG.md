@@ -69,6 +69,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `Manager` arms its cross-thread wakeup pipe at construction, so `wakeup()` works without the caller arming it first. Previously a `Manager` that had never been woken had no socketpair and the wakeup was silently discarded. Arming it on first use instead would have been worse than useless: it allocates a `Connection` and splices it into `mgr->conns` from the calling thread while the loop thread walks that list -- a data race in exactly the cross-thread case `wakeup()` exists to serve. The cost is one socketpair per `Manager`; `ShardedManager`'s workers already paid it
 
 
+### Security
+
+- **HTTP request smuggling via POST/PUT without Content-Length.** The parser counted such a request's headers twice, so it skipped that many bytes of the next pipelined request. A client could pad the first request so parsing resumed inside the next request's body. That body then ran as a separate request. Inherited from Mongoose 7.21
+
+- **One spoofed datagram redirected all DNS queries.** Any UDP sender overwrote the resolver socket's peer address. Later queries and their txnids then went to the attacker, who could answer every lookup. UDP clients now drop datagrams from any other peer. This covers all UDP clients, so replies from a different server address are also dropped. Inherited from Mongoose 7.21
+
+- **DNS replies were matched on txnid alone.** A blind attacker forging the resolver's address only had to guess 16 bits, for any name in flight. A reply must now also carry the queried name as its one question, compared case-insensitively. Mismatched replies leave the lookup pending, so they cannot fail it. Forged replies that guess both the txnid and the name are still accepted
+
 ## [0.2.0] - 2026-07-19
 
 ### Added

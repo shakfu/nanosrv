@@ -1424,6 +1424,99 @@ static void test_dns_ignores_spoofed_source()
     close(attacker);
 }
 
+// A reply from the resolver's address must also answer the question we asked.
+static void test_dns_checks_question_name()
+{
+    int resolver = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(resolver >= 0);
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(18897);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    assert(bind(resolver, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) == 0);
+
+    Manager mgr;
+    mgr.raw()->dns4.url = "udp://127.0.0.1:18897";
+
+    struct sockaddr_in client{};
+    socklen_t client_len = sizeof(client);
+    uint8_t query[512];
+    auto recv_query = [&]() {
+        ssize_t n = -1;
+        for (int i = 0; i < 50 && n < 0; i++) {
+            mgr.poll(5ms);
+            n = recvfrom(resolver, query, sizeof(query), MSG_DONTWAIT,
+                         reinterpret_cast<struct sockaddr*>(&client), &client_len);
+        }
+        assert(n > 12);
+        return static_cast<size_t>(n);
+    };
+    auto send_pkt = [&](const std::vector<uint8_t>& pkt) {
+        assert(sendto(resolver, pkt.data(), pkt.size(), 0,
+                      reinterpret_cast<struct sockaddr*>(&client), client_len) > 0);
+        for (int i = 0; i < 10; i++)
+            mgr.poll(5ms);
+    };
+    const uint8_t ip[] = {127, 0, 0, 1};
+    const uint8_t a_rr[] = {0, 1, 0, 1, 0, 0, 0, 60, 0, 4};
+    auto append = [](std::vector<uint8_t>& v, const uint8_t* p, size_t n) {
+        v.insert(v.end(), p, p + n);
+    };
+    // The query as a response with one A record, owned by a pointer to the question.
+    auto reply = [&](size_t qlen) {
+        std::vector<uint8_t> pkt(query, query + qlen);
+        const uint8_t owner[] = {0xc0, 0x0c};
+        pkt[2] = 0x81, pkt[3] = 0x80, pkt[7] = 1;
+        append(pkt, owner, sizeof(owner));
+        append(pkt, a_rr, sizeof(a_rr));
+        append(pkt, ip, sizeof(ip));
+        return pkt;
+    };
+    const uint32_t loopback = inet_addr("127.0.0.1");
+
+    uint32_t mixed_ip = 0;
+    http_connect(mgr.raw(), "http://Mixed.Test:1/", dns_test_handler, &mixed_ip);
+    size_t qlen = recv_query();
+
+    std::vector<uint8_t> wrong_name = reply(qlen);
+    wrong_name[13] = 'X';  // first letter of the first label
+    send_pkt(wrong_name);
+    assert(mixed_ip == 0);
+
+    // No question at all: header, then the answer with its name spelled out.
+    std::vector<uint8_t> no_question(query, query + 12);
+    no_question[2] = 0x81, no_question[3] = 0x80, no_question[5] = 0, no_question[7] = 1;
+    append(no_question, query + 12, qlen - 12 - 4);
+    append(no_question, a_rr, sizeof(a_rr));
+    append(no_question, ip, sizeof(ip));
+    send_pkt(no_question);
+    assert(mixed_ip == 0);
+
+    // The forged replies left the lookup pending. Case differences are allowed.
+    std::vector<uint8_t> other_case = reply(qlen);
+    other_case[13] = 'm';
+    send_pkt(other_case);
+    assert(mixed_ip == loopback);
+
+    // A CNAME chain: the A record's owner differs from the question.
+    uint32_t cname_ip = 0;
+    http_connect(mgr.raw(), "http://alias.test:1/", dns_test_handler, &cname_ip);
+    qlen = recv_query();
+    const uint8_t target[] = {1, 'c', 4, 't', 'e', 's', 't', 0};
+    const uint8_t cname_rr[] = {0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60, 0, sizeof(target)};
+    std::vector<uint8_t> cname(query, query + qlen);
+    cname[2] = 0x81, cname[3] = 0x80, cname[7] = 2;
+    append(cname, cname_rr, sizeof(cname_rr));
+    append(cname, target, sizeof(target));
+    append(cname, target, sizeof(target));
+    append(cname, a_rr, sizeof(a_rr));
+    append(cname, ip, sizeof(ip));
+    send_pkt(cname);
+    assert(cname_ip == loopback);
+
+    close(resolver);
+}
+
 // H3 Stage B: the destructor must shut down an in-flight run() (possibly on
 // another thread) on its own -- without an explicit stop()/join beforehand --
 // rather than racing teardown against the running loops.
@@ -2199,6 +2292,7 @@ int main()
     test_sharded_multiple_listeners();
     test_sharded_worker_hooks();
     test_dns_ignores_spoofed_source();
+    test_dns_checks_question_name();
 #endif
 
     puts("All tests passed");

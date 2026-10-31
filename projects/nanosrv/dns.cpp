@@ -9,6 +9,7 @@ struct dns_data {
     struct Connection* c;
     uint64_t expire;
     uint16_t txnid;
+    char name[256]; // queried name, compared with the reply's question
 };
 
 static void sendnsreq(struct Connection*, struct Str*, int,
@@ -175,6 +176,18 @@ bool dns_parse(const uint8_t* buf, size_t len, struct DnsMessage* dm)
     return true;
 }
 
+// dm->name can't be used here: answers overwrite it, and after a CNAME it holds
+// the canonical name.
+static bool dns_question_is(const uint8_t* buf, size_t len, const char* name)
+{
+    const struct DnsHeader* h = reinterpret_cast<const struct DnsHeader*>(buf);
+    char question[sizeof(DnsMessage::name)];
+    if (ntohs_(h->num_questions) != 1)
+        return false;
+    dns_parse_name(buf, len, sizeof(*h), question, sizeof(question));
+    return casecmp(question, name) == 0; // resolvers may change the case
+}
+
 static void dns_cb(struct Connection* c, int ev, void* ev_data)
 {
     struct dns_data *d, *tmp;
@@ -198,7 +211,8 @@ static void dns_cb(struct Connection* c, int ev, void* ev_data)
             for (d = *head; d != NULL; d = tmp) {
                 tmp = d->next;
                 // MG_INFO(("d %p %hu %hu", d, d->txnid, dm.txnid));
-                if (dm.txnid != d->txnid)
+                if (dm.txnid != d->txnid
+                    || !dns_question_is(c->recv.buf, c->recv.len, d->name))
                     continue;
                 if (d->c->is_resolving) {
                     if (dm.resolved) {
@@ -313,6 +327,10 @@ static void sendnsreq(struct Connection* c, struct Str* name, int ms,
                 break;
         }
         d->txnid = id;
+        size_t name_len = name->len < sizeof(d->name) ? name->len : sizeof(d->name) - 1;
+        if (name_len > 0 && name->buf[name_len - 1] == '.')
+            name_len--; // the decoded question has no root dot
+        memcpy(d->name, name->buf, name_len); // calloc'ed: stays terminated
         d->next = reqs;
         c->mgr->active_dns_requests = d;
         d->expire = millis() + static_cast<uint64_t>(ms);
