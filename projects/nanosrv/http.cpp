@@ -711,7 +711,6 @@ void http_cb(struct Connection* c, int ev, void* ev_data)
                     // content has no defined semantics (RFC 7231)
                     if (hm.body.len != 0)
                         require_content_len = true;
-                    ofs += static_cast<size_t>(n); // this request has been processed
                 } else if (is_response) {
                     // HTTP spec 7.2 Entity body: All other responses must
                     // include a body or Content-Length header field defined

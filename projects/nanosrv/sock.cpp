@@ -329,8 +329,16 @@ static long recv_raw(struct Connection* c, void* buf, size_t len)
         union usa usa;
         socklen_t slen = tousa(&c->rem, &usa);
         n = recvfrom(FD(c), static_cast<char*>(buf), len, 0, &usa.sa, &slen);
-        if (n > 0)
-            tomgaddr(&usa, &c->rem, slen != sizeof(usa.sin));
+        if (n > 0) {
+            struct Address from = c->rem;
+            tomgaddr(&usa, &from, slen != sizeof(usa.sin));
+            // A client talks to one peer: drop datagrams from anyone else.
+            if (c->is_client
+                && (from.port != c->rem.port
+                    || memcmp(from.addr.ip, c->rem.addr.ip, sizeof(from.addr.ip)) != 0))
+                return MG_IO_WAIT;
+            c->rem = from;
+        }
     } else {
         n = recv(FD(c), static_cast<char*>(buf), len, MSG_NONBLOCKING);
     }

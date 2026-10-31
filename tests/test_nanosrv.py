@@ -948,6 +948,42 @@ def _ws_recv(sock, timeout=5):
     return opcode, payload
 
 
+class TestPipelining:
+    @pytest.mark.parametrize("method", ["POST", "PUT"])
+    def test_body_after_bodyless_request_is_not_parsed(self, method):
+        # The bodyless request is padded to the length of the /pub headers, so
+        # skipping that many bytes would land exactly on the /pub body.
+        smuggled = b"GET /admin HTTP/1.1\r\nHost: x\r\n\r\n"
+        pub = (
+            b"GET /pub HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Length: %d\r\n\r\n" % len(smuggled)
+        )
+        first = f"{method} /a HTTP/1.1\r\nHost: x\r\nX-Pad: \r\n\r\n".encode()
+        assert len(first) < len(pub)
+        first = first.replace(b"X-Pad: ", b"X-Pad: " + b"p" * (len(pub) - len(first)))
+        assert len(first) == len(pub)
+
+        seen = []
+
+        def handler(conn, msg):
+            seen.append(msg.uri)
+            conn.http_reply(200, "", "ok")
+
+        mgr = nanosrv.Manager()
+        port = 18419 if method == "POST" else 18420
+        mgr.http_listen(f"http://127.0.0.1:{port}", handler)
+        with _polling(mgr):
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as s:
+                s.sendall(first + pub + smuggled)
+                buf = b""
+                while buf.count(b"HTTP/1.1 ") < 2:
+                    chunk = s.recv(4096)
+                    assert chunk, f"closed early: {buf!r}"
+                    buf += chunk
+                time.sleep(0.1)  # let any extra request reach the handler
+        assert seen == ["/a", "/pub"]
+
+
 class TestBinaryPayloads:
     def test_request_body_is_bytes(self):
         mgr = nanosrv.Manager()
