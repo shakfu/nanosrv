@@ -1487,3 +1487,215 @@ class TestShardedParity:
 
         for path in paths:
             assert results.get(path) == path.encode(), f"{path}: {results}"
+
+
+# ---------------------------------------------------------------------------
+# Exceptions raised by a handler
+# ---------------------------------------------------------------------------
+
+OK_REQUEST = b"GET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+BOOM_REQUEST = b"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"
+
+
+def _read_to_eof(sock, timeout=5):
+    """Read until the server closes; a timeout means it left the socket open."""
+    sock.settimeout(timeout)
+    buf = b""
+    while chunk := sock.recv(4096):
+        buf += chunk
+    return buf
+
+
+def _exchange(port, request):
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(request)
+        return _read_to_eof(s)
+
+
+@contextmanager
+def _serving(mgr):
+    """Drive either manager type for the block."""
+    runner = _running if isinstance(mgr, nanosrv.ShardedManager) else _polling
+    with runner(mgr):
+        yield
+
+
+@pytest.fixture
+def unraisable(monkeypatch):
+    """Collect the exceptions handed to sys.unraisablehook."""
+    seen = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda u: seen.append(u.exc_value))
+    return seen
+
+
+# Sharded with one worker: a poisoned thread state hangs every later request.
+MANAGERS = [nanosrv.Manager, lambda: nanosrv.ShardedManager(1)]
+MANAGER_IDS = ["manager", "sharded"]
+
+
+@pytest.mark.parametrize("make_mgr", MANAGERS, ids=MANAGER_IDS)
+class TestHandlerException:
+    @pytest.mark.parametrize("listen", ["http_listen", "http_listen_event"])
+    def test_replies_500_closes_and_keeps_serving(
+        self, make_mgr, listen, unraisable
+    ):
+        mgr = make_mgr()
+
+        def respond(conn, msg):
+            if msg.uri == "/boom":
+                raise ValueError("boom")
+            conn.http_reply(200, "", b"ok")
+
+        def on_event(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                respond(conn, data)
+
+        handler = respond if listen == "http_listen" else on_event
+        getattr(mgr, listen)("http://127.0.0.1:18420", handler)
+        with _serving(mgr):
+            for _ in range(3):
+                reply = _exchange(18420, BOOM_REQUEST)
+                assert reply.startswith(b"HTTP/1.1 500 ")
+                assert b"Connection: close\r\n" in reply
+                assert _exchange(18420, OK_REQUEST).endswith(b"ok")
+
+        assert [type(e) for e in unraisable] == [ValueError] * 3
+
+    def test_no_500_after_a_complete_reply(self, make_mgr, unraisable):
+        mgr = make_mgr()
+
+        def handler(conn, msg):
+            conn.http_reply(200, "", b"done")
+            raise ValueError("boom")
+
+        mgr.http_listen("http://127.0.0.1:18421", handler)
+        with _serving(mgr):
+            reply = _exchange(18421, BOOM_REQUEST)
+
+        assert reply.startswith(b"HTTP/1.1 200 ") and reply.endswith(b"done")
+        assert reply.count(b"HTTP/1.1") == 1
+
+    def test_partial_stream_is_truncated_not_appended_to(
+        self, make_mgr, unraisable
+    ):
+        mgr = make_mgr()
+
+        def handler(conn, msg):
+            conn.start_chunked(200)
+            conn.write_chunk(b"part")
+            raise ValueError("boom")
+
+        mgr.http_listen("http://127.0.0.1:18422", handler)
+        with _serving(mgr):
+            reply = _exchange(18422, BOOM_REQUEST)
+
+        assert reply.count(b"HTTP/1.1") == 1
+        assert b"part" in reply
+        assert not reply.endswith(b"0\r\n\r\n")  # no terminating chunk
+
+    def test_pipelined_requests_stop_at_the_failure(self, make_mgr, unraisable):
+        """A request after "Connection: close" must not reach the handler."""
+        mgr = make_mgr()
+        calls = []
+
+        def handler(conn, msg):
+            calls.append(msg.uri)
+            raise ValueError("boom")
+
+        mgr.http_listen("http://127.0.0.1:18423", handler)
+        with _serving(mgr):
+            reply = _exchange(18423, BOOM_REQUEST + BOOM_REQUEST)
+
+        assert reply.count(b"HTTP/1.1 500 ") == 1
+        assert calls == ["/boom"]
+
+    def test_websocket_is_closed_without_an_http_reply(self, make_mgr, unraisable):
+        mgr = make_mgr()
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                if data.uri == "/ok":
+                    conn.http_reply(200, "", b"ok")
+                else:
+                    conn.ws_upgrade(data, "")
+            elif ev == nanosrv.Event.WsMessage:
+                raise ValueError("boom")
+
+        mgr.http_listen_event("http://127.0.0.1:18424", handler)
+        with _serving(mgr):
+            s = _ws_connect("127.0.0.1", 18424)
+            try:
+                _ws_send(s, b"hi")
+                assert _read_to_eof(s) == b""
+            finally:
+                s.close()
+            assert _exchange(18424, OK_REQUEST).endswith(b"ok")
+
+    def test_failed_wakeup_closes_the_waiting_connection(
+        self, make_mgr, unraisable
+    ):
+        mgr = make_mgr()
+        conn_ids = []
+
+        def handler(conn, ev, data):
+            if ev == nanosrv.Event.HttpMessage:
+                conn_ids.append(conn.id)  # defer the reply to the wakeup
+            elif ev == nanosrv.Event.Wakeup:
+                raise ValueError("boom")
+
+        mgr.http_listen_event("http://127.0.0.1:18425", handler)
+        with _serving(mgr):
+            with socket.create_connection(("127.0.0.1", 18425), timeout=5) as s:
+                s.sendall(BOOM_REQUEST)
+                deadline = time.time() + 5
+                while not conn_ids and time.time() < deadline:
+                    time.sleep(0.01)
+                assert mgr.wakeup(conn_ids[0]) is True
+                assert _read_to_eof(s) == b""
+
+
+def test_listener_survives_a_failing_handler(unraisable):
+    """Manager only: a sharded handler never sees the acceptor's events."""
+    mgr = nanosrv.Manager()
+    armed = threading.Event()  # disarmed before the fixture's hook is removed
+    armed.set()
+
+    def handler(conn, ev, data):
+        if armed.is_set() and conn.is_listening and ev == nanosrv.Event.Poll:
+            raise ValueError("boom")
+        if ev == nanosrv.Event.HttpMessage:
+            conn.http_reply(200, "", b"ok")
+
+    mgr.http_listen_event("http://127.0.0.1:18426", handler)
+    with _serving(mgr):
+        assert _exchange(18426, OK_REQUEST).endswith(b"ok")
+    armed.clear()
+
+    assert unraisable, "the listener's handler never raised"
+
+
+def test_keyboard_interrupt_in_handler_reaches_the_polling_thread(unraisable):
+    """Ctrl-C landing inside a handler must still stop a Manager loop."""
+    mgr = nanosrv.Manager()
+
+    def handler(conn, msg):
+        raise KeyboardInterrupt
+
+    mgr.http_listen("http://127.0.0.1:18427", handler)
+    replies = []
+    client = threading.Thread(
+        target=lambda: replies.append(_exchange(18427, BOOM_REQUEST))
+    )
+    client.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                mgr.poll(10)
+        for _ in range(5):  # flush the 500 and the close
+            mgr.poll(10)
+    finally:
+        client.join(timeout=6)
+
+    assert replies and replies[0].startswith(b"HTTP/1.1 500 ")
+    assert unraisable == []

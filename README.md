@@ -212,6 +212,10 @@ Note that `close()` is immediate and discards whatever is still buffered for sen
 
 The `Connection`, `HttpMessage`, and `WsMessage` objects handed to a handler are **borrowed views valid only for the duration of that call**. They point into buffers owned by the event loop, which reuses or frees them as soon as the handler returns. Do not stash one and touch it later (from another thread, a timer, or a subsequent event) -- read what you need during the call, and copy out any bytes you must keep (e.g. `bytes(msg.body)` / `std::string(hm.body...)`). The Python bindings enforce this: a stored `Connection`/`HttpMessage` raises if used after the callback returns (see `tests/test_nanosrv.py`, `TestCallbackObjectLifetime`). To act on a connection later, keep `conn.id` and call `wakeup(id, data)` on the `Manager` or `ShardedManager` from any thread; the handler is invoked again with `Event.Wakeup` and the payload as `bytes`. The long-lived exception is `ConnectionRef`, the non-owning handle returned by `http_listen()`, which stays valid until its listener closes.
 
+#### Handler exceptions
+
+An exception raised by a Python handler goes to `sys.unraisablehook`, and the manager keeps serving. An HTTP request whose handler wrote nothing gets a 500. Any other failure on an accepted connection closes it after flushing what is buffered, so a partial response arrives truncated. `KeyboardInterrupt` is raised again on the main thread. `SystemExit` is reported like any other exception and does not stop the server.
+
 ### Enums
 
 | Enum | Values |

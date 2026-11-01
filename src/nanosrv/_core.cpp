@@ -45,6 +45,34 @@ static std::shared_ptr<nb::object> make_callback(nb::object callback)
                                        });
 }
 
+// Consume an exception a handler raised. Leaving it set (PyErr_Restore) was wrong:
+// the thread state outlives the callback, so every later callback on it failed.
+// `sent_before` is c.send.len on handler entry. An HTTP request whose handler
+// wrote nothing gets a 500; bytes already written make a 500 corrupt the stream,
+// so those connections only close, which truncates a partial response visibly.
+static void handle_handler_error(nb::python_error& e, nb::handle callback,
+                                 nanosrv::Connection& c, size_t sent_before,
+                                 nanosrv::Event ev)
+{
+    // Ctrl-C lands in whichever handler runs on the main thread. Discarding it
+    // would ignore the signal, so raise it again after poll() returns.
+    if (e.matches(PyExc_KeyboardInterrupt))
+        PyErr_SetInterrupt();
+    else
+        e.discard_as_unraisable(callback);
+
+    // Only accepted connections: an exception on the listener's own events must
+    // not stop the server.
+    if (!c.is_accepted || c.is_closing)
+        return;
+    if (ev == nanosrv::Event::HttpMessage && c.send.len == sent_before)
+        nanosrv::http_reply_bytes(&c, 500, "Connection: close\r\n", nullptr, 0);
+    // is_resp stops http_cb parsing: it would otherwise hand pipelined requests
+    // to the handler, on the read loop or at close, after the reply said close.
+    c.is_resp = 1;
+    c.is_draining = 1;
+}
+
 // ---------------------------------------------------------------------------
 // Scoped-validity wrappers (fixes H2)
 // ---------------------------------------------------------------------------
@@ -696,6 +724,7 @@ NB_MODULE(_core, m) {
                      [cb](nanosrv::Connection& c, nanosrv::HttpMessage& hm) {
                          nb::gil_scoped_acquire acquire;
                          auto alive = std::make_shared<bool>(true);
+                         const size_t sent_before = c.send.len;
                          try {
                              // Pass by value (temporaries): nanobind moves each
                              // wrapper into a Python-owned object that outlives
@@ -703,7 +732,8 @@ NB_MODULE(_core, m) {
                              // and is gated only by the shared `alive` token.
                              (*cb)(PyConn{&c, alive}, PyHttpMsg{&hm, alive});
                          } catch (nb::python_error& e) {
-                             e.restore();
+                             handle_handler_error(e, *cb, c, sent_before,
+                                                  nanosrv::Event::HttpMessage);
                          }
                          *alive = false;  // invalidate any stored wrappers
                      };
@@ -723,6 +753,7 @@ NB_MODULE(_core, m) {
                           void* ev_data) {
                          nb::gil_scoped_acquire acquire;
                          auto alive = std::make_shared<bool>(true);
+                         const size_t sent_before = c.send.len;
                          try {
                              if (ev == nanosrv::Event::HttpMessage ||
                                  ev == nanosrv::Event::WsOpen) {
@@ -748,7 +779,8 @@ NB_MODULE(_core, m) {
                                  (*cb)(PyConn{&c, alive}, ev, nb::none());
                              }
                          } catch (nb::python_error& e) {
-                             e.restore();
+                             handle_handler_error(e, *cb, c, sent_before,
+                                                  ev);
                          }
                          *alive = false;  // invalidate any stored wrappers
                      };
@@ -836,10 +868,12 @@ NB_MODULE(_core, m) {
                      [cb](nanosrv::Connection& c, nanosrv::HttpMessage& hm) {
                          nb::gil_scoped_acquire acquire;
                          auto alive = std::make_shared<bool>(true);
+                         const size_t sent_before = c.send.len;
                          try {
                              (*cb)(PyConn{&c, alive}, PyHttpMsg{&hm, alive});
                          } catch (nb::python_error& e) {
-                             e.restore();
+                             handle_handler_error(e, *cb, c, sent_before,
+                                                  nanosrv::Event::HttpMessage);
                          }
                          *alive = false;
                      };
@@ -859,6 +893,7 @@ NB_MODULE(_core, m) {
                           void* ev_data) {
                          nb::gil_scoped_acquire acquire;
                          auto alive = std::make_shared<bool>(true);
+                         const size_t sent_before = c.send.len;
                          try {
                              if (ev == nanosrv::Event::HttpMessage ||
                                  ev == nanosrv::Event::WsOpen) {
@@ -879,7 +914,8 @@ NB_MODULE(_core, m) {
                                  (*cb)(PyConn{&c, alive}, ev, nb::none());
                              }
                          } catch (nb::python_error& e) {
-                             e.restore();
+                             handle_handler_error(e, *cb, c, sent_before,
+                                                  ev);
                          }
                          *alive = false;
                      };
