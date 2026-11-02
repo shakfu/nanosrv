@@ -954,9 +954,8 @@ class TestPipelining:
         # The bodyless request is padded to the length of the /pub headers, so
         # skipping that many bytes would land exactly on the /pub body.
         smuggled = b"GET /admin HTTP/1.1\r\nHost: x\r\n\r\n"
-        pub = (
-            b"GET /pub HTTP/1.1\r\nHost: x\r\n"
-            b"Content-Length: %d\r\n\r\n" % len(smuggled)
+        pub = b"GET /pub HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(
+            smuggled
         )
         first = f"{method} /a HTTP/1.1\r\nHost: x\r\nX-Pad: \r\n\r\n".encode()
         assert len(first) < len(pub)
@@ -1536,9 +1535,7 @@ MANAGER_IDS = ["manager", "sharded"]
 @pytest.mark.parametrize("make_mgr", MANAGERS, ids=MANAGER_IDS)
 class TestHandlerException:
     @pytest.mark.parametrize("listen", ["http_listen", "http_listen_event"])
-    def test_replies_500_closes_and_keeps_serving(
-        self, make_mgr, listen, unraisable
-    ):
+    def test_replies_500_closes_and_keeps_serving(self, make_mgr, listen, unraisable):
         mgr = make_mgr()
 
         def respond(conn, msg):
@@ -1575,9 +1572,7 @@ class TestHandlerException:
         assert reply.startswith(b"HTTP/1.1 200 ") and reply.endswith(b"done")
         assert reply.count(b"HTTP/1.1") == 1
 
-    def test_partial_stream_is_truncated_not_appended_to(
-        self, make_mgr, unraisable
-    ):
+    def test_partial_stream_is_truncated_not_appended_to(self, make_mgr, unraisable):
         mgr = make_mgr()
 
         def handler(conn, msg):
@@ -1631,9 +1626,7 @@ class TestHandlerException:
                 s.close()
             assert _exchange(18424, OK_REQUEST).endswith(b"ok")
 
-    def test_failed_wakeup_closes_the_waiting_connection(
-        self, make_mgr, unraisable
-    ):
+    def test_failed_wakeup_closes_the_waiting_connection(self, make_mgr, unraisable):
         mgr = make_mgr()
         conn_ids = []
 

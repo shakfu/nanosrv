@@ -13,6 +13,9 @@ wheels/
 # Virtual environments
 .venv
 
+# pma
+.pma
+
 # transient-docs
 REVIEW.md
 
